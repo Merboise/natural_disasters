@@ -1,0 +1,13 @@
+# Core
+numpy>=1.25
+pandas>=2.0
+shapely>=2.0
+geopandas>=0.14
+pyproj>=3.5
+fiona>=1.9
+
+# Raster + DEM work
+rasterio>=1.3
+
+# Optional niceties
+tqdm>=4.66
