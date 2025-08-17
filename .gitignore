@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.env
+.env.*
+
+# Notebooks / editors
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+
+# Data/output you likely don't want in git
+/data/
+disaster_output/
+logs/
+output/
+tmp/
+cache/
+
+# GIS artifacts
+*.gdb/
+*.gpkg
+*.dbf
+*.shp
+*.shx
+*.prj
+*.qpj
+*.cpg
+*.sbx
+*.sbn
+*.zip
+
+# Rasters (keep DEMs out of git; store paths only)
+*.tif
+*.tiff
+*.aux
+*.ovr
+*.xml
+*.tfw
