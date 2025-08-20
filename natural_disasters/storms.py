@@ -6,7 +6,7 @@ from shapely.geometry import Point, MultiPoint, Polygon
 from .helpers import (
     AGENCY_PREF, RAD_TIERS, QUADS, NM_TO_KM,
     CLIMO_R34_NM, SSHS_SCALE_K,
-    _clean_radius, _first_positive, build_circle, extract_polygons_only,
+    clean_radius, first_positive, build_circle, extract_polygons_only,
     diagnose_geom, log_polygon_failure,
 )
 
@@ -58,7 +58,7 @@ def get_quadrant_radii(row):
             vals={}
             for q in QUADS:
                 col=f"{a}_{tier}_{q}"
-                v = _clean_radius(row.get(col))
+                v = clean_radius(row.get(col))
                 vals[q]= v*NM_TO_KM if pd.notna(v) else np.nan
             if any(pd.notna(vals[q]) and vals[q]>0 for q in QUADS):
                 return tier, vals, a
@@ -170,8 +170,8 @@ def process_ibtracs_data(input_file: str, output_folder: str, sample_size=None, 
                         polys.append(poly)
                         continue
                 # fallback circles
-                roci_nm = _first_positive(row, [f"{a}_ROCI" for a in AGENCY_PREF])
-                rmw_nm  = _first_positive(row, [f"{a}_RMW"  for a in AGENCY_PREF])
+                roci_nm = first_positive(row, [f"{a}_ROCI" for a in AGENCY_PREF])
+                rmw_nm  = first_positive(row, [f"{a}_RMW"  for a in AGENCY_PREF])
                 if pd.notna(roci_nm):
                     c = build_circle(lat, lon, roci_nm)
                     if c is not None and not c.is_empty:
@@ -193,10 +193,25 @@ def process_ibtracs_data(input_file: str, output_folder: str, sample_size=None, 
             # Representative values for selection
             sshs_max = group["USA_SSHS"].dropna().max() if "USA_SSHS" in group else np.nan
             basin = str(group["BASIN"].iloc[0]) if "BASIN" in group and pd.notna(group["BASIN"].iloc[0]) else None
+            # Collect candidate columns
             roci_cols = [c for c in group.columns if c.endswith("_ROCI")]
             rmw_cols  = [c for c in group.columns if c.endswith("_RMW")]
-            have_roci_nm = np.nanmedian(pd.to_numeric(group[roci_cols].values.reshape(-1), errors="coerce")) if roci_cols else np.nan
-            have_rmw_nm  = np.nanmedian(pd.to_numeric(group[rmw_cols].values.reshape(-1),  errors="coerce")) if rmw_cols  else np.nan
+
+            def safe_group_median(cols):
+                if not cols:
+                    return np.nan, 0
+                s = pd.to_numeric(group[cols].stack(), errors="coerce")
+                count = s.notna().sum()
+                return (s.median(skipna=True) if count else np.nan), int(count)
+
+            have_roci_nm, roci_n = safe_group_median(roci_cols)
+            have_rmw_nm,  rmw_n  = safe_group_median(rmw_cols)
+
+            logging.debug(
+                f"SID={sid} ROCI cols={roci_cols} nonnull={roci_n} "
+                f"RMW cols={rmw_cols} nonnull={rmw_n} "
+                f"→ ROCI_med={have_roci_nm}, RMW_med={have_rmw_nm}"
+            )
 
             method, conf, geom = select_best_storm_geom(
                 group, basin=basin, sshs_max=sshs_max,

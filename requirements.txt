@@ -5,6 +5,7 @@ shapely>=2.0
 geopandas>=0.14
 pyproj>=3.5
 fiona>=1.9
+python-dotenv
 
 # Raster + DEM work
 rasterio>=1.3

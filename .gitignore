@@ -12,6 +12,7 @@ dist/
 venv/
 .env
 .env.*
+ibtracs.ALL.list.v04r01.csv
 
 # Notebooks / editors
 .ipynb_checkpoints/
@@ -20,7 +21,7 @@ venv/
 .DS_Store
 
 # Data/output you likely don't want in git
-/data/
+data/
 disaster_output/
 logs/
 output/
