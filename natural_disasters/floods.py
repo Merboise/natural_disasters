@@ -140,7 +140,7 @@ def _read_tabular(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, low_memory=False)
 
 # ---------------- Date helpers ----------------
-def _scalar_date(y, m, d) -> pd.Timestamp | pd.NaT:
+def _scalar_date(y, m, d) -> Optional[pd.Timestamp]:
     try:
         if pd.isna(y):
             return pd.NaT
@@ -402,13 +402,13 @@ def process_flood_data(
     recs += load_hanze_csv_to_polys(
         Path(hanze_csv) if hanze_csv else None,
         Path(hanze_regions_2010) if hanze_regions_2010 else None,
-        Path(hanze_regions_2021) ifarande(hanze_regions_2021) else None,
+        Path(hanze_regions_2021) if hanze_regions_2021 else None,
         regions_layer_2010=hanze_regions_2010_layer,
         regions_layer_2021=hanze_regions_2021_layer,
         code_field_2010=hanze_code_field_2010,
         code_field_2021=hanze_code_field_2021,
         simplify_tolerance_deg=simplify_tolerance_deg,
-    )
+        )
     recs += load_usfd_v11(Path(usfd_csv) if usfd_csv else None)
 
     if not recs:

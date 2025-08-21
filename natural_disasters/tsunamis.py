@@ -1,37 +1,42 @@
-# tsunamis.py — streamlined + fast-mode + optional parallel
-# ---------------------------------------------------------
-# Key improvements:
-# - Preview & valid-pixel thresholds to skip near-empty blocks
-# - Per-block union before writing (massive dissolve speedup)
-# - Optional fast mode: no temp GPKGs; tile unions done in-memory
-# - Optional parallelization across (event, ISO) groups
-# - More robust logging, normalization (C8), and writer hardening
+# tsunamis.py — coastal-ROI streaming, robust DEM index, fast-mode unions
+# ----------------------------------------------------------------------
+# - Robust DEM index ingestion (no more "Unknown column geometry")
+# - Country-coastal ROI: (country polygon) ∩ buffer(coastline, inland_limit_km)
+# - Windowed streaming on non-tiled TIFFs (512×512 generator if needed)
+# - GDAL cache + uint8 masks to cut RAM
+# - Per-block -> per-tile unions; optional disk streaming for debugging
+# - Same public signatures as before (process_tsunami_data / build_tsunami_inundation)
 
-import os, logging, math, tempfile, time
+import os
+# set GDAL/PROJ before geospatial imports
+os.environ.setdefault("GDAL_DATA", r"C:\OSGeo4W\share\gdal")
+os.environ.setdefault("PROJ_LIB",  r"C:\OSGeo4W\share\proj")
+os.environ.setdefault("GPD_READ_FILE_ENGINE",  "pyogrio")
+os.environ.setdefault("GPD_WRITE_FILE_ENGINE", "pyogrio")
+
+import logging, math, tempfile, time
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 
 from shapely.geometry import (
     Point, Polygon, MultiPolygon, LineString, MultiLineString,
-    GeometryCollection, shape, mapping
+    GeometryCollection, shape, mapping, box
 )
 from shapely.ops import unary_union
 
 import rasterio
-from rasterio import features
+from rasterio import features, windows
 from rasterio.enums import Resampling
-from datetime import datetime  # noqa
+from rasterio.windows import Window
 
 import fiona
 
 try:
     from memory_profiler import profile
-except Exception:
-    # fallback if memory_profiler is absent
+except Exception:  # pragma: no cover
     def profile(f): return f
 
-# env (optional)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -39,26 +44,249 @@ except Exception:
     pass
 
 from .helpers import diagnose_geom, ISO_COL
-from .dem_manager_local import build_local_dem_index, select_tiles_for_geom  # noqa: F401 (may be unused)
-
-os.environ.setdefault("GDAL_DATA", r"C:\OSGeo4W\share\gdal")
-os.environ.setdefault("PROJ_LIB",  r"C:\OSGeo4W\share\proj")
-# Optional: default IO engine choices
-os.environ.setdefault("GPD_READ_FILE_ENGINE",  "pyogrio")
-os.environ.setdefault("GPD_WRITE_FILE_ENGINE", "pyogrio")  # Fiona forced for FileGDB in _write_vector
+from .dem_manager_local import build_local_dem_index
 
 DEFAULT_DEM_LOCAL_ROOT = os.getenv("DEM_LOCAL_ROOT")
+DEFAULT_MAX_INLAND_KM = 1.0     # hard cap for tsunami use-case
+DEFAULT_COAST_TOUCH_M = 200.0   # band width that shapes must touch
 WGS84 = "EPSG:4326"
 
+# ---------------------------
+# Small logging helpers
+# ---------------------------
+def _diagnose_geom(tag: str, geom):
+    try:
+        b = getattr(geom, "bounds", None)
+        logging.debug(
+            f"[{tag}] type={getattr(geom, 'geom_type', type(geom))}, "
+            f"empty={getattr(geom,'is_empty',None)}, valid={getattr(geom,'is_valid',None)}, "
+            f"bounds={b}"
+        )
+    except Exception:
+        pass
+
+def _log_df_schema(tag: str, df: pd.DataFrame):
+    try:
+        logging.info(f"[{tag}] rows={len(df)}, cols={list(df.columns)}")
+        if hasattr(df, "dtypes"):
+            logging.info(f"[{tag}] dtypes:\n{df.dtypes}")
+    except Exception:
+        pass
 
 # ---------------------------
-# Geometry utility functions
+# Geometry/GeoDataFrame utils
+# ---------------------------
+
+def _build_coast_touch_band(coast_line_wgs: gpd.GeoSeries, coast_touch_m: float = DEFAULT_COAST_TOUCH_M):
+    rim_m = coast_line_wgs.to_crs("EPSG:3857").iloc[0].buffer(max(50.0, float(coast_touch_m)))
+    return gpd.GeoSeries([rim_m], crs="EPSG:3857").to_crs(WGS84).iloc[0]
+
+def _activate_geometry_column(gdf: gpd.GeoDataFrame, geom_col: str | None = None, crs=WGS84) -> gpd.GeoDataFrame:
+    """Ensure GeoDataFrame has a proper GeometryArray (works after pandas ops)."""
+    from shapely.geometry import shape as shape_from_geojson
+
+    if not isinstance(gdf, gpd.GeoDataFrame):
+        if geom_col is None:
+            cand = next((c for c in getattr(gdf, "columns", []) if c.lower() in ("geometry","geom")), None)
+            if cand is None:
+                raise ValueError(f"No geometry column found; cols={list(getattr(gdf,'columns',[]))}")
+            geom_col = cand
+        gdf = gpd.GeoDataFrame(gdf, geometry=geom_col, crs=crs)
+
+    gname = getattr(gdf.geometry, "name", "geometry")
+    if gname not in gdf.columns:
+        raise ValueError(f"Active geometry '{gname}' missing; cols={list(gdf.columns)}")
+
+    # already GeometryArray?
+    try:
+        from geopandas.array import GeometryDtype
+        if isinstance(getattr(gdf.geometry, "dtype", None), GeometryDtype):
+            if gdf.crs is None:
+                gdf.set_crs(crs, allow_override=True, inplace=True)
+            return gdf
+    except Exception:
+        pass
+
+    # Rehydrate via WKB
+    def _to_wkb(v):
+        if v is None:
+            return None
+        if hasattr(v, "wkb"):
+            return v.wkb
+        try:
+            g = shape_from_geojson(v)  # dict-like
+            return g.wkb
+        except Exception:
+            pass
+        try:
+            from shapely import from_wkt
+            return from_wkt(v).wkb if isinstance(v, str) else None
+        except Exception:
+            return None
+
+    vals = gdf[gname].values
+    wkb = [_to_wkb(v) for v in vals]
+    from geopandas.array import from_wkb
+    ga = from_wkb(np.array(wkb, dtype=object))
+    gdf = gdf.set_geometry(gpd.GeoSeries(ga, crs=(gdf.crs or crs)))
+    if gdf.crs is None:
+        gdf.set_crs(crs, allow_override=True, inplace=True)
+    return gdf
+
+def _only_polygons(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Keep only Polygon/MultiPolygon (convert others conservatively)."""
+    g = gdf[gdf.geometry.notna() & (~gdf.geometry.is_empty)].copy()
+    if g.empty:
+        return g
+
+    def _to_poly(geom):
+        if geom.geom_type in ("Polygon","MultiPolygon"):
+            return geom
+        try:
+            hull = geom.convex_hull
+            if hull.geom_type in ("Polygon","MultiPolygon"):
+                return hull
+        except Exception:
+            pass
+        try:
+            b0 = geom.buffer(0)
+            if b0.geom_type in ("Polygon","MultiPolygon"):
+                return b0
+        except Exception:
+            pass
+        return None
+
+    g["geometry"] = g.geometry.apply(_to_poly)
+    g = g[g.geometry.notna() & (~g.geometry.is_empty)]
+    return g
+
+def _ensure_gdf(df):
+    """Coerce to GeoDataFrame (preserve active geometry), ensure WGS84."""
+    if isinstance(df, gpd.GeoDataFrame):
+        gdf = df.copy()
+        geom_name = getattr(gdf, "geometry", None).name if hasattr(gdf, "geometry") else None
+        if geom_name is None:
+            for cand in ("geometry", "geom", "Geometry", "GEOMETRY"):
+                if cand in gdf.columns:
+                    gdf = gdf.set_geometry(cand, inplace=False)
+                    break
+    else:
+        cols = list(getattr(df, "columns", []))
+        geom_col = None
+        for cand in ("geometry", "geom", "Geometry", "GEOMETRY"):
+            if cand in cols:
+                geom_col = cand
+                break
+        if geom_col is None:
+            raise ValueError(f"DEM index has no geometry column; cols={cols}")
+        gdf = gpd.GeoDataFrame(df.copy(), geometry=geom_col)
+
+    if gdf.crs is None:
+        gdf = gdf.set_crs(WGS84, allow_override=True)
+    elif str(gdf.crs) != WGS84:
+        gdf = gdf.to_crs(WGS84)
+    return gdf
+
+def _normalize_to_polygonal(geom, crs=WGS84):
+    """Return a Polygon/MultiPolygon suitable for writing."""
+    if geom is None or getattr(geom, "is_empty", True):
+        return None
+    g = geom
+    if g.geom_type == "GeometryCollection":
+        polys = [p for p in g.geoms if p.geom_type in ("Polygon", "MultiPolygon")]
+        g = unary_union(polys) if polys else g.convex_hull
+    if g.geom_type not in ("Polygon","MultiPolygon"):
+        try: g = g.convex_hull
+        except Exception: pass
+    if g.geom_type not in ("Polygon","MultiPolygon"):
+        try: g = g.buffer(0)
+        except Exception: pass
+    if g.geom_type not in ("Polygon","MultiPolygon"):
+        return None
+    try:
+        from shapely import set_precision
+        g = set_precision(g.buffer(0), grid_size=1e-8)
+    except Exception:
+        g = g.buffer(0)
+    return None if getattr(g, "is_empty", True) else g
+
+def _safe_select_tiles(index_gdf, geom_wgs84):
+    """Select tiles intersecting geom_wgs84 (no sjoin needed)."""
+    gdf = _ensure_gdf(index_gdf)
+    geom = gpd.GeoSeries([geom_wgs84], crs=WGS84).iloc[0]
+    try:
+        idx = list(gdf.sindex.query(geom, predicate="intersects"))
+        cand = gdf.iloc[idx] if idx else gdf.iloc[[]]
+    except Exception:
+        minx, miny, maxx, maxy = gpd.GeoSeries([geom], crs=WGS84).total_bounds
+        b = gdf.geometry.bounds
+        cand = gdf[(b.minx <= maxx) & (b.maxx >= minx) & (b.miny <= maxy) & (b.maxy >= miny)]
+    if cand.empty:
+        return cand
+    mask = cand.intersects(geom)
+    out = cand.loc[mask].copy()
+    out.reset_index(drop=True, inplace=True)
+    return out
+
+def _promote_dem_index(index_df: pd.DataFrame, dem_tile_size_deg: int | None = None) -> gpd.GeoDataFrame:
+    """
+    Robustly build a GeoDataFrame from any DEM index:
+      - Existing GeoDataFrame
+      - shapely/geojson/WKT column
+      - bbox columns (minx,miny,maxx,maxy or left,bottom,right,top)
+      - center + tile size (lon/lat or x/y) if provided
+    Must include 'path'.
+    """
+    _log_df_schema("DEM index (raw)", index_df)
+
+    # normalize path
+    if "path" not in index_df.columns:
+        for alt in ("PATH", "file", "filepath", "FilePath", "raster", "src"):
+            if alt in index_df.columns:
+                index_df = index_df.rename(columns={alt: "path"})
+                break
+    if "path" not in index_df.columns:
+        raise ValueError("DEM index must contain a 'path' column.")
+
+    # already GeoDataFrame?
+    if isinstance(index_df, gpd.GeoDataFrame) and getattr(index_df, "geometry", None) is not None:
+        return _activate_geometry_column(index_df, crs=WGS84)
+
+    # shapely/geojson/WKT col
+    for c in index_df.columns:
+        s = pd.Series(index_df[c]).dropna()
+        if s.empty:
+            continue
+        v = s.iloc[0]
+        if hasattr(v, "geom_type"):
+            return _activate_geometry_column(gpd.GeoDataFrame(index_df.copy(), geometry=c, crs=WGS84), crs=WGS84)
+        if isinstance(v, dict) and "type" in v and "coordinates" in v:
+            return _activate_geometry_column(gpd.GeoDataFrame(index_df.copy(), geometry=c, crs=WGS84), crs=WGS84)
+        if isinstance(v, str) and v[:6].upper() in ("POINT(", "LINEST", "POLYGO", "MULTIP", "GEOMET"):
+            return _activate_geometry_column(gpd.GeoDataFrame(index_df.copy(), geometry=c, crs=WGS84), crs=WGS84)
+
+    # bbox columns
+    for a,b,c,d in (("minx","miny","maxx","maxy"), ("left","bottom","right","top"), ("xmin","ymin","xmax","ymax")):
+        if all(col in index_df.columns for col in (a,b,c,d)):
+            geoms = [box(float(r[a]), float(r[b]), float(r[c]), float(r[d])) for _, r in index_df.iterrows()]
+            return gpd.GeoDataFrame(index_df.copy(), geometry=gpd.GeoSeries(geoms, crs=WGS84))
+
+    # center + tile size
+    if dem_tile_size_deg:
+        for cx, cy in (("lon","lat"),("longitude","latitude"),("x","y")):
+            if cx in index_df.columns and cy in index_df.columns:
+                half = float(dem_tile_size_deg) / 2.0
+                geoms = [box(float(r[cx])-half, float(r[cy])-half, float(r[cx])+half, float(r[cy])+half)
+                         for _, r in index_df.iterrows()]
+                return gpd.GeoDataFrame(index_df.copy(), geometry=gpd.GeoSeries(geoms, crs=WGS84))
+
+    raise ValueError("Could not locate/construct a geometry column in the DEM index.")
+
+# ---------------------------
+# Coast / ROI helpers
 # ---------------------------
 def _snap_points_to_coast(runups_gdf, coast_gdf, max_km=10):
-    """
-    Snap runup points to the nearest coastline within max_km.
-    Returns (snapped_points_gdf, coast_lines_geoseries)
-    """
+    """Snap runup points to nearest coastline within max_km."""
     line_parts = []
     for geom in coast_gdf.geometry:
         if geom is None or geom.is_empty:
@@ -89,18 +317,15 @@ def _snap_points_to_coast(runups_gdf, coast_gdf, max_km=10):
     out = runups_gdf.reset_index(drop=True).copy()
     pts_m = out.to_crs(m_crs).geometry
 
-    snapped_pts = []
-    dists_km = []
+    snapped_pts, dists_km = [], []
     for p in pts_m:
         s = coast_m.project(p)
         sp = coast_m.interpolate(s)
         d_km = p.distance(sp) / 1000.0
         if (max_km is None) or (d_km <= float(max_km)):
-            snapped_pts.append(sp)
-            dists_km.append(d_km)
+            snapped_pts.append(sp); dists_km.append(d_km)
         else:
-            snapped_pts.append(None)
-            dists_km.append(np.inf)
+            snapped_pts.append(None); dists_km.append(np.inf)
 
     keep_mask = np.array([sp is not None for sp in snapped_pts], dtype=bool)
     if not keep_mask.any():
@@ -112,177 +337,7 @@ def _snap_points_to_coast(runups_gdf, coast_gdf, max_km=10):
     out["snapped_dist_km"] = np.asarray(dists_km, dtype=float)[keep_mask]
     out["snapped_geom"] = snapped_series_m.to_crs(runups_gdf.crs).values
     out = out.set_geometry("snapped_geom")
-
     return out, coast_lines
-
-
-def _diagnose_geom(tag: str, geom):
-    try:
-        b = getattr(geom, "bounds", None)
-        logging.debug(
-            f"[{tag}] type={getattr(geom, 'geom_type', type(geom))}, "
-            f"empty={getattr(geom,'is_empty',None)}, valid={getattr(geom,'is_valid',None)}, "
-            f"bounds={b}"
-        )
-    except Exception:
-        pass
-
-
-def _activate_geometry_column(gdf: gpd.GeoDataFrame, geom_col: str | None = None, crs="EPSG:4326") -> gpd.GeoDataFrame:
-    import numpy as np
-    from shapely.geometry import shape as shape_from_geojson
-
-    if not isinstance(gdf, gpd.GeoDataFrame):
-        if geom_col is None:
-            cand = next((c for c in getattr(gdf, "columns", []) if c.lower() in ("geometry", "geom")), None)
-            if cand is None:
-                raise ValueError(f"No geometry column found in columns={list(getattr(gdf,'columns',[]))}")
-            geom_col = cand
-        gdf = gpd.GeoDataFrame(gdf, geometry=geom_col, crs=crs)
-
-    gname = getattr(gdf.geometry, "name", "geometry")
-    if gname not in gdf.columns:
-        raise ValueError(f"Active geometry '{gname}' missing; cols={list(gdf.columns)}")
-
-    # Detect if already a GeometryArray
-    try:
-        from geopandas.array import GeometryDtype
-        if isinstance(getattr(gdf.geometry, "dtype", None), GeometryDtype):
-            if gdf.crs is None:
-                gdf.set_crs(crs, allow_override=True, inplace=True)
-            return gdf
-    except Exception:
-        pass
-
-    # Rehydrate any objects (None, shapely, or geojson-like) to a GeometryArray via WKB
-    def _to_wkb(v):
-        if v is None:
-            return None
-        if hasattr(v, "wkb"):
-            return v.wkb
-        # dict-like or mapping?
-        try:
-            g = shape_from_geojson(v)
-            return g.wkb
-        except Exception:
-            pass
-        # WKT string?
-        try:
-            from shapely import from_wkt
-            g = from_wkt(v) if isinstance(v, str) else None
-            return g.wkb if g is not None else None
-        except Exception:
-            return None
-
-    vals = gdf[gname].values
-    wkb_bytes = [_to_wkb(v) for v in vals]
-    from geopandas.array import from_wkb
-    ga = from_wkb(np.array(wkb_bytes, dtype=object))
-    gdf = gdf.set_geometry(gpd.GeoSeries(ga, crs=(gdf.crs or crs)))
-
-    if gdf.crs is None:
-        gdf.set_crs(crs, allow_override=True, inplace=True)
-    return gdf
-
-
-def _only_polygons(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """
-    Keep only Polygon/MultiPolygon (convert others conservatively).
-    Prevents “unknown geometry type” on write with Fiona/GDB.
-    """
-    g = gdf[gdf.geometry.notna() & (~gdf.geometry.is_empty)].copy()
-    if g.empty:
-        return g
-
-    def _to_poly(geom):
-        if geom.geom_type in ("Polygon", "MultiPolygon"):
-            return geom
-        # try convex hull then buffer(0)
-        try:
-            hull = geom.convex_hull
-            if hull.geom_type in ("Polygon", "MultiPolygon"):
-                return hull
-        except Exception:
-            pass
-        try:
-            b0 = geom.buffer(0)
-            if b0.geom_type in ("Polygon", "MultiPolygon"):
-                return b0
-        except Exception:
-            pass
-        return None
-
-    g["geometry"] = g.geometry.apply(_to_poly)
-    g = g[g.geometry.notna() & (~g.geometry.is_empty)]
-    return g
-
-
-def _log_geom_mix(tag, g):
-    try:
-        mix = g.geometry.geom_type.value_counts().to_dict()
-        logging.info(f"[{tag}] geometry mix: {mix}")
-    except Exception:
-        pass
-
-
-def _ensure_gdf(df):
-    """
-    Coerce df to a GeoDataFrame with a valid geometry column and CRS=WGS84.
-    IMPORTANT: we do NOT rename the geometry column here to avoid
-    GeoPandas 'Unknown column geometry' issues on some versions.
-    """
-    if isinstance(df, gpd.GeoDataFrame):
-        gdf = df.copy()
-        # If, for any reason, the active geometry is unset, try to set it.
-        geom_name = getattr(gdf, "geometry", None).name if hasattr(gdf, "geometry") else None
-        if geom_name is None:
-            for cand in ("geometry", "geom", "Geometry", "GEOMETRY"):
-                if cand in gdf.columns:
-                    gdf = gdf.set_geometry(cand, inplace=False)
-                    break
-    else:
-        # Find a plausible geometry column
-        cols = list(getattr(df, "columns", []))
-        geom_col = None
-        for cand in ("geometry", "geom", "Geometry", "GEOMETRY"):
-            if cand in cols:
-                geom_col = cand
-                break
-        if geom_col is None:
-            raise ValueError(f"DEM index has no geometry column; cols={cols}")
-        gdf = gpd.GeoDataFrame(df.copy(), geometry=geom_col)
-
-    # DO NOT rename geometry; keep whatever name is active.
-    if gdf.crs is None:
-        gdf = gdf.set_crs(WGS84, allow_override=True)
-    elif str(gdf.crs) != WGS84:
-        gdf = gdf.to_crs(WGS84)
-    return gdf
-
-
-def _safe_select_tiles(index_gdf, geom_wgs84):
-    """Select tiles intersecting geom_wgs84 without using sjoin (avoids geometry-column issues)."""
-    gdf = _ensure_gdf(index_gdf)
-    geom = gpd.GeoSeries([geom_wgs84], crs=WGS84).iloc[0]
-
-    # Try spatial index first
-    try:
-        idx = list(gdf.sindex.query(geom, predicate="intersects"))
-        cand = gdf.iloc[idx] if idx else gdf.iloc[[]]
-    except Exception:
-        # Fallback: coarse bbox filter
-        minx, miny, maxx, maxy = gpd.GeoSeries([geom], crs=WGS84).total_bounds
-        b = gdf.geometry.bounds
-        cand = gdf[(b.minx <= maxx) & (b.maxx >= minx) & (b.miny <= maxy) & (b.maxy >= miny)]
-
-    if cand.empty:
-        return cand
-
-    mask = cand.intersects(geom)
-    out = cand.loc[mask].copy()
-    out.reset_index(drop=True, inplace=True)
-    return out
-
 
 def _idw_alongshore(snapped_runups, coast_line, power=2, min_pts=3, step_km=2.0):
     if len(snapped_runups) < min_pts:
@@ -302,8 +357,7 @@ def _idw_alongshore(snapped_runups, coast_line, power=2, min_pts=3, step_km=2.0)
     valid = np.isfinite(z_known)
     if valid.sum() < min_pts:
         return gpd.GeoDataFrame(columns=["geometry", "ru_m"], crs=snapped_runups.crs)
-    s_known = s_known[valid]
-    z_known = z_known[valid]
+    s_known = s_known[valid]; z_known = z_known[valid]
 
     n_steps = int(np.ceil(line_m.length / (step_km * 1000.0)))
     s_targets = np.linspace(0, line_m.length, max(n_steps, 2))
@@ -319,335 +373,257 @@ def _idw_alongshore(snapped_runups, coast_line, power=2, min_pts=3, step_km=2.0)
     coast_samples_m = gpd.GeoDataFrame({"ru_m": ru_vals}, geometry=pts, crs=m_crs)
     return coast_samples_m.to_crs(snapped_runups.crs)
 
+def _compute_roi(coast_line_wgs: gpd.GeoSeries, country_poly_wgs: MultiPolygon | Polygon, inland_limit_km: float):
+    """
+    Return:
+      - strip_wgs: narrow 2 km coastal strip (for diagnostics)
+      - roi_wgs:   (country polygon) ∩ buffer(coastline, inland_limit_km)
+    """
+    # narrow strip (2 km)
+    strip_m = coast_line_wgs.to_crs("EPSG:3857").iloc[0].buffer(2000)
+    strip_wgs = gpd.GeoSeries([strip_m], crs="EPSG:3857").to_crs(WGS84).iloc[0]
 
-def _coastal_strip(coast_geom, width_m=2000):
-    return coast_geom.buffer(width_m)
+    # country ∩ (coast buffer to inland limit)
+    coast_buffer_m = coast_line_wgs.to_crs("EPSG:3857").iloc[0].buffer(max(500.0, inland_limit_km * 1000.0))
+    coast_buffer_wgs = gpd.GeoSeries([coast_buffer_m], crs="EPSG:3857").to_crs(WGS84).iloc[0]
 
+    roi = gpd.GeoSeries([country_poly_wgs], crs=WGS84).intersection(coast_buffer_wgs).iloc[0]
+    return strip_wgs, (roi if (roi is not None and not roi.is_empty) else coast_buffer_wgs)
 
 def sector_clip(poly, coast_centroid_wgs, source_point_wgs, half_angle_deg=60, max_range_km=2000):
     """
-    Clip polygon to a wedge facing from coastal centroid toward source.
-    All inputs expected in WGS84. Returns original poly if inputs missing.
+    Clip polygon to a wedge facing from coastal centroid toward the source.
     """
-    if poly is None or poly.is_empty or source_point_wgs is None or coast_centroid_wgs is None:
+    if poly is None or getattr(poly, "is_empty", True) or source_point_wgs is None or coast_centroid_wgs is None:
         return poly
 
     m_crs = "EPSG:3857"
-    c_m = gpd.GeoSeries([coast_centroid_wgs], crs="EPSG:4326").to_crs(m_crs).iloc[0]
-    s_m = gpd.GeoSeries([source_point_wgs], crs="EPSG:4326").to_crs(m_crs).iloc[0]
+    c_m = gpd.GeoSeries([coast_centroid_wgs], crs=WGS84).to_crs(m_crs).iloc[0]
+    s_m = gpd.GeoSeries([source_point_wgs], crs=WGS84).to_crs(m_crs).iloc[0]
 
-    dx = s_m.x - c_m.x
-    dy = s_m.y - c_m.y
+    dx = s_m.x - c_m.x; dy = s_m.y - c_m.y
     base_ang_rad = math.atan2(dy, dx)
     half = math.radians(half_angle_deg)
     R = max_range_km * 1000.0
 
     angles = np.linspace(base_ang_rad - half, base_ang_rad + half, 64)
-    xs = c_m.x + R * np.cos(angles)
-    ys = c_m.y + R * np.sin(angles)
+    xs = c_m.x + R * np.cos(angles); ys = c_m.y + R * np.sin(angles)
     wedge_m = Polygon([(c_m.x, c_m.y), *zip(xs, ys)])
 
-    poly_m = gpd.GeoSeries([poly], crs="EPSG:4326").to_crs(m_crs).iloc[0]
+    poly_m = gpd.GeoSeries([poly], crs=WGS84).to_crs(m_crs).iloc[0]
     clipped_m = poly_m.intersection(wedge_m)
-    return gpd.GeoSeries([clipped_m], crs=m_crs).to_crs("EPSG:4326").iloc[0]
+    return gpd.GeoSeries([clipped_m], crs=m_crs).to_crs(WGS84).iloc[0]
 
-def _log_df_schema(tag: str, df: pd.DataFrame, n_preview: int = 5):
-    try:
-        logging.info(f"[{tag}] type={type(df).__name__}, rows={len(df)}, cols={list(df.columns)}")
-        if hasattr(df, "dtypes"):
-            logging.info(f"[{tag}] dtypes=\n{df.dtypes}")
-        # show first non-null sample per column
-        for c in list(df.columns)[:32]:
-            s = pd.Series(df[c]).dropna()
-            if s.empty:
-                logging.debug(f"[{tag}] {c}: all null")
+# ---------------------------
+# Window iterator (for non-tiled TIFFs)
+# ---------------------------
+def _iter_windows(ds: rasterio.io.DatasetReader, roi_bounds=None, tile=512):
+    """
+    Yield fixed-size windows (tile×tile), culled by optional roi_bounds=(minx,miny,maxx,maxy) in ds CRS.
+    """
+    width, height = ds.width, ds.height
+    if roi_bounds is None:
+        cols = range(0, width, tile)
+        rows = range(0, height, tile)
+        for r0 in rows:
+            for c0 in cols:
+                w = min(tile, width - c0)
+                h = min(tile, height - r0)
+                yield Window(c0, r0, w, h)
+        return
+
+    # cull by bounds
+    for r0 in range(0, height, tile):
+        for c0 in range(0, width, tile):
+            w = min(tile, width - c0)
+            h = min(tile, height - r0)
+            win = Window(c0, r0, w, h)
+            left, bottom, right, top = windows.bounds(win, ds.transform)
+            rb_minx, rb_miny, rb_maxx, rb_maxy = roi_bounds
+            if (right < rb_minx) or (left > rb_maxx) or (top < rb_miny) or (bottom > rb_maxy):
                 continue
-            v = s.iloc[0]
-            vtype = type(v).__name__
-            vs = str(v)
-            if len(vs) > 120:
-                vs = vs[:117] + "..."
-            logging.debug(f"[{tag}] sample {c}: {vtype} = {vs}")
-        # quick guess of geometry-like columns
-        geomish = []
-        for c in df.columns:
-            s = pd.Series(df[c]).dropna()
-            if s.empty:
-                continue
-            v = s.iloc[0]
-            if hasattr(v, "geom_type"):
-                geomish.append((c, "shapely"))
-            elif isinstance(v, dict) and "type" in v and "coordinates" in v:
-                geomish.append((c, "geojson"))
-            elif isinstance(v, str) and v[:6].upper() in ("POINT(", "LINEST", "POLYGO", "MULTIP", "GEOMET"):
-                geomish.append((c, "wkt?"))
-        if geomish:
-            logging.info(f"[{tag}] geometry-like candidates: {geomish}")
-        else:
-            logging.info(f"[{tag}] no obvious geometry-like columns detected")
-    except Exception as e:
-        logging.warning(f"[{tag}] schema logging failed: {e}")
+            yield win
 
 # ------------------------------------------------------------
-# STREAMED DEM → POLYGON PIPELINE (with per-block union)
+# STREAMED DEM → POLYGON PIPELINE (per-block union; ROI-culling)
 # ------------------------------------------------------------
 @profile
 def stream_flood_polygons_from_dem(
     dem_path: str,
-    strip_wgs,                         # WGS84 coastal strip geometry
-    min_elev_m: float,                 # Emin (e.g., -1.0)
-    max_elev_m: float,                 # Hmax (ceil(ru + 1.5))
-    inland_limit_km: float,            # inland cap for clip
-    tmp_vector_path: str | None,       # on-disk target (GeoPackage path) if writing
+    roi_wgs,                          # unchanged: country ∩ coastline buffer
+    min_elev_m: float,
+    max_elev_m: float,
+    tmp_vector_path: str | None,
     layer_name: str = "flood",
-    simplify_m: float = 0.0,           # optional simplify in meters (after union)
-    min_area_m2: float = 5000.0,       # drop tiny slivers (bigger default)
-    mode: str = "w",                   # "w" first tile, then "a" for subsequent tiles
-    # new skip thresholds:
-    min_preview_hits: int = 8,         # require some hits in 32x32 preview
-    min_valid_pixels: int = 200,       # require N true pixels in full block
-    # fast mode:
-    return_union: bool = False,        # if True, do not write; return unioned geometry (WGS84) for this tile
+    simplify_m: float = 0.0,
+    min_area_m2: float = 5000.0,
+    mode: str = "w",
+    min_preview_hits: int = 8,
+    min_valid_pixels: int = 200,
+    return_union: bool = False,
+    gdal_cache_mb: int = 512,
+    coast_touch_wgs=None              # thin coastal contact band (WGS84)
 ):
-    """
-    Streamed threshold→polygon pipeline for MERIT-Hydro (float32 EGM96, nodata=-9999).
-    - Per-block union drastically reduces downstream dissolve work.
-    - In 'return_union=True' mode, the function returns a unioned shapely geometry (WGS84)
-      for the entire tile and writes nothing to disk.
-    """
-    crs_wgs = "EPSG:4326"
+
+    crs_wgs = WGS84
+
     if (not return_union) and (mode == "w") and tmp_vector_path and os.path.exists(tmp_vector_path):
-        try:
-            os.remove(tmp_vector_path)
-        except OSError:
-            pass
+        try: os.remove(tmp_vector_path)
+        except OSError: pass
 
-    blocks_total = 0
-    blocks_bbox_pass = 0
-    blocks_preview_pass = 0
-    blocks_polygonized = 0
-    feats_written = 0
-
-    tile_parts_dem = []  # only used when return_union=True
-
-    # Open data sources / sink conditionally
+    blocks_total = blocks_preview_pass = blocks_polygonized = feats_written = 0
+    tile_parts_dem = []
     sink = None
     schema = {"geometry": "Polygon", "properties": {"src": "str:8"}}
-    try:
+
+    with rasterio.Env(GDAL_CACHEMAX=gdal_cache_mb):
         ds = rasterio.open(dem_path)
-        nodata = ds.nodata if ds.nodata is not None else -9999.0
-        Hmax_f32 = np.float32(max_elev_m)
-        Emin_f32 = np.float32(min_elev_m)
+        try:
+            nodata = ds.nodata if ds.nodata is not None else -9999.0
+            Hmax_f32 = np.float32(max_elev_m); Emin_f32 = np.float32(min_elev_m)
 
-        # Precompute clips in DEM CRS + fast bbox for block culling
-        strip_dem = gpd.GeoSeries([strip_wgs], crs=crs_wgs).to_crs(ds.crs).iloc[0]
-        inland_clip_dem = gpd.GeoSeries([strip_wgs], crs=crs_wgs) \
-            .to_crs("EPSG:3857").buffer(inland_limit_km * 1000.0) \
-            .to_crs(ds.crs).iloc[0]
-        ic_minx, ic_miny, ic_maxx, ic_maxy = inland_clip_dem.bounds
+            roi_dem = gpd.GeoSeries([roi_wgs], crs=crs_wgs).to_crs(ds.crs).iloc[0]
+            coast_touch_dem = None
+            if coast_touch_wgs is not None:
+                coast_touch_dem = gpd.GeoSeries([coast_touch_wgs], crs=WGS84).to_crs(ds.crs).iloc[0]
+            rb = roi_dem.bounds  # (minx,miny,maxx,maxy)
 
-        if not return_union:
-            sink = fiona.open(tmp_vector_path, mode, driver="GPKG",
-                              layer=layer_name, schema=schema, crs=crs_wgs)
+            if not return_union:
+                sink = fiona.open(tmp_vector_path, mode, driver="GPKG",
+                                  layer=layer_name, schema=schema, crs=crs_wgs)
 
-        for (j, i), window in ds.block_windows(1):
-            # heartbeat
-            if (j * 10_000 + i) % 500 == 0:
-                logging.debug(f"Scanning blocks… j={j}, i={i}")
-            blocks_total += 1
+            # Choose block iterator:
+            use_native_blocks = bool(ds.profile.get("tiled", False))
+            if use_native_blocks:
+                block_iter = (w for (_, _), w in ds.block_windows(1))
+            else:
+                block_iter = _iter_windows(ds, roi_bounds=rb, tile=512)
 
-            # fast bbox reject
-            left, bottom, right, top = rasterio.windows.bounds(window, ds.transform)
-            if (right < ic_minx) or (left > ic_maxx) or (top < ic_miny) or (bottom > ic_maxy):
-                continue
-            blocks_bbox_pass += 1
-
-            # tiny preview
-            thumb = ds.read(1, window=window, out_shape=(1, 32, 32),
-                            resampling=Resampling.nearest, masked=False).astype(np.float32, copy=False)
-            valid_thumb = (thumb != nodata)
-            if not valid_thumb.any():
-                continue
-            tmin = float(np.min(thumb[valid_thumb])); tmax = float(np.max(thumb[valid_thumb]))
-            # quick range reject
-            if (tmin > Hmax_f32) or (tmax < Emin_f32):
-                continue
-            # require some "in-range" pixels in preview
-            hit = (thumb >= Emin_f32) & (thumb <= Hmax_f32)
-            if int(hit.sum()) < int(min_preview_hits):
-                continue
-            blocks_preview_pass += 1
-
-            # read the real block
-            a = ds.read(1, window=window, masked=False).astype(np.float32, copy=False)
-            valid = (a != nodata)
-            np.logical_and(valid, a >= Emin_f32, out=valid)
-            np.logical_and(valid, a <= Hmax_f32, out=valid)
-            n_valid = int(valid.sum())
-            if n_valid < int(min_valid_pixels):
-                continue
-
-            mask = valid.astype(np.uint8, copy=False)
-
-            # collect all positives for this block, then union once
-            block_geoms = []
-            for geom_js, v in features.shapes(mask, transform=rasterio.windows.transform(window, ds.transform)):
-                if v != 1:
+            for window in block_iter:
+                # fast bbox reject
+                left, bottom, right, top = windows.bounds(window, ds.transform)
+                if (right < rb[0]) or (left > rb[2]) or (top < rb[1]) or (bottom > rb[3]):
                     continue
-                try:
-                    poly_dem = shape(geom_js)
-                    # enforce polygonal & validity early (prevents odd collections/lines)
-                    poly_dem = poly_dem.buffer(0)
-                except Exception:
+
+                blocks_total += 1
+
+                # tiny preview
+                thumb = ds.read(1, window=window, out_shape=(1, 32, 32),
+                                resampling=Resampling.nearest, masked=False).astype(np.float32, copy=False)
+                valid_thumb = (thumb != nodata)
+                if not valid_thumb.any():
                     continue
-                # clip tests
-                if not (poly_dem.intersects(inland_clip_dem) and poly_dem.intersects(strip_dem)):
+                tmin = float(np.min(thumb[valid_thumb])); tmax = float(np.max(thumb[valid_thumb]))
+                if (tmin > Hmax_f32) or (tmax < Emin_f32):
                     continue
-                # sliver cut
-                if min_area_m2 > 0.0:
+                hit = (thumb >= Emin_f32) & (thumb <= Hmax_f32)
+                if int(hit.sum()) < int(min_preview_hits):
+                    continue
+                blocks_preview_pass += 1
+
+                # full window
+                a = ds.read(1, window=window, masked=False).astype(np.float32, copy=False)
+                valid = (a != nodata)
+                np.logical_and(valid, a >= Emin_f32, out=valid)
+                np.logical_and(valid, a <= Hmax_f32, out=valid)
+                n_valid = int(valid.sum())
+                if n_valid < int(min_valid_pixels):
+                    continue
+
+                mask = valid.astype(np.uint8, copy=False)
+
+                # polygonize positives, clip to ROI & touch rim
+                block_geoms = []
+                for geom_json, v in features.shapes(mask, transform=windows.transform(window, ds.transform)):
+                    if v != 1:
+                        continue
                     try:
-                        area_m2 = gpd.GeoSeries([poly_dem], crs=ds.crs).to_crs("EPSG:3857").area.iloc[0]
-                        if area_m2 < float(min_area_m2):
-                            continue
+                        poly_dem = shape(geom_json).buffer(0)
+                    except Exception:
+                        continue
+                    if not poly_dem.intersects(roi_dem):
+                        continue
+                    if coast_touch_dem is not None and not poly_dem.intersects(coast_touch_dem):
+                        continue
+
+                    # area filter (meters)
+                    if min_area_m2 > 0.0:
+                        try:
+                            area_m2 = gpd.GeoSeries([poly_dem], crs=ds.crs).to_crs("EPSG:3857").area.iloc[0]
+                            if area_m2 < float(min_area_m2):
+                                continue
+                        except Exception:
+                            pass
+                    block_geoms.append(poly_dem)
+
+                if not block_geoms:
+                    continue
+
+                try:
+                    block_union = unary_union(block_geoms)
+                except Exception:
+                    block_union = unary_union([g for g in block_geoms if (g is not None and not g.is_empty)])
+
+                block_union = _normalize_to_polygonal(block_union, crs=str(ds.crs)) or block_union
+
+                if simplify_m and simplify_m > 0:
+                    try:
+                        block_union = gpd.GeoSeries([block_union], crs=ds.crs)\
+                            .to_crs("EPSG:3857").buffer(0).simplify(simplify_m)\
+                            .to_crs(ds.crs).iloc[0]
                     except Exception:
                         pass
-                block_geoms.append(poly_dem)
 
-            if not block_geoms:
-                continue
+                blocks_polygonized += 1
 
-            # per-block union
-            try:
-                block_union = unary_union(block_geoms)
-            except Exception:
-                # fallback: if union fails, keep parts
-                block_union = MultiPolygon([g for g in block_geoms if g.geom_type == "Polygon"]) \
-                    if any(g.geom_type == "Polygon" for g in block_geoms) else unary_union(block_geoms)
+                if return_union:
+                    tile_parts_dem.append(block_union)
+                else:
+                    parts = (block_union.geoms if block_union.geom_type == "MultiPolygon" else [block_union])
+                    wgs_parts = gpd.GeoSeries(parts, crs=ds.crs).to_crs(crs_wgs)
+                    for p in wgs_parts:
+                        try:
+                            sink.write({"geometry": mapping(p), "properties": {"src": "dem"}})
+                            feats_written += 1
+                        except Exception as e:
+                            logging.error(f"Fiona write failed for {tmp_vector_path}: {e}")
 
-            # make sure the union is polygonal & valid (C8)
-            block_union = _normalize_to_polygonal(block_union, crs=str(ds.crs)) or block_union
-
-            # optional simplify in projected meters
-            if simplify_m and simplify_m > 0:
-                try:
-                    block_union = gpd.GeoSeries([block_union], crs=ds.crs) \
-                        .to_crs("EPSG:3857").buffer(0).simplify(simplify_m) \
-                        .to_crs(ds.crs).iloc[0]
-                except Exception:
-                    pass
-
-            blocks_polygonized += 1  # once per block producing geometry
+            logging.info(
+                f"[stream_flood] {os.path.basename(dem_path)} "
+                f"blocks: total={blocks_total}, preview_pass={blocks_preview_pass}, "
+                f"polygonized_blocks≈{blocks_polygonized}, feats_written={feats_written}"
+            )
 
             if return_union:
-                # collect for later union (do not return inside the block loop)
-                tile_parts_dem.append(block_union)
-            else:
-                # write minimal number of features (parts) in WGS84
-                parts = (block_union.geoms if block_union.geom_type == "MultiPolygon" else [block_union])
-                wgs_parts = gpd.GeoSeries(parts, crs=ds.crs).to_crs(crs_wgs)
-                for p in wgs_parts:
-                    try:
-                        sink.write({"geometry": mapping(p), "properties": {"src": "dem"}})
-                        feats_written += 1
-                    except Exception as e:
-                        logging.error(f"Fiona write failed for {tmp_vector_path}: {e}")
+                if not tile_parts_dem:
+                    return None
+                try:
+                    tile_union = unary_union(tile_parts_dem)
+                except Exception:
+                    tile_union = unary_union([g for g in tile_parts_dem if (g is not None and not g.is_empty)])
+                tile_union = _normalize_to_polygonal(tile_union, crs=str(ds.crs)) or tile_union
+                return gpd.GeoSeries([tile_union], crs=ds.crs).to_crs(crs_wgs).iloc[0]
 
-        # log summary
-        logging.info(
-            f"[stream_flood] {os.path.basename(dem_path)} "
-            f"blocks: total={blocks_total}, bbox_pass={blocks_bbox_pass}, "
-            f"preview_pass={blocks_preview_pass}, polygonized_blocks≈{blocks_polygonized}, "
-            f"feats_written={feats_written}" + (f" → {os.path.basename(tmp_vector_path)}" if tmp_vector_path else "")
-        )
+            return tmp_vector_path
 
-        if return_union:
-            if not tile_parts_dem:
-                return None
+        finally:
             try:
-                tile_union = unary_union(tile_parts_dem)
+                if sink is not None:
+                    sink.close()
             except Exception:
-                # defensive union
-                tile_union = unary_union([g for g in tile_parts_dem if (g is not None and not g.is_empty)])
-            # normalize and return in WGS84
-            tile_union = _normalize_to_polygonal(tile_union, crs=str(ds.crs)) or tile_union
-            return gpd.GeoSeries([tile_union], crs=ds.crs).to_crs(crs_wgs).iloc[0]
+                pass
+            try:
+                ds.close()
+            except Exception:
+                pass
 
-        return tmp_vector_path
-
-    finally:
-        try:
-            if sink is not None:
-                sink.close()
-        except Exception:
-            pass
-        try:
-            ds.close()
-        except Exception:
-            pass
-
-
-def _normalize_to_polygonal(geom, crs="EPSG:4326"):
-    """
-    Return a Polygon/MultiPolygon suitable for writing.
-    - Accepts any shapely geometry (incl. GeometryCollection/mixed)
-    - Extracts polygonal parts; if none, uses convex hull as last resort
-    - Fixes validity via buffer(0) and optional precision reduce
-    """
-    if geom is None:
-        return None
-    if getattr(geom, "is_empty", True):
-        return None
-
-    # 1) Extract polygonal parts if needed
-    g = geom
-    if g.geom_type == "GeometryCollection":
-        polys = [p for p in g.geoms if p.geom_type in ("Polygon", "MultiPolygon")]
-        if polys:
-            g = unary_union(polys)
-        else:
-            # no polygonal content → use convex hull
-            g = g.convex_hull
-
-    # 2) If still non-polygon, try convex hull / buffer(0)
-    if g.geom_type not in ("Polygon", "MultiPolygon"):
-        try:
-            g = g.convex_hull
-        except Exception:
-            pass
-    if g.geom_type not in ("Polygon", "MultiPolygon"):
-        try:
-            g = g.buffer(0)
-        except Exception:
-            pass
-
-    # 3) Still not polygonal? give up cleanly
-    if g.geom_type not in ("Polygon", "MultiPolygon"):
-        return None
-
-    # 4) Fix tiny self-intersections & precision noise
-    try:
-        # Shapely 2.x has set_precision
-        from shapely import set_precision
-        g = set_precision(g.buffer(0), grid_size=1e-8)
-    except Exception:
-        g = g.buffer(0)
-
-    # Final guard
-    if getattr(g, "is_empty", True):
-        return None
-    return g
-
-
+# ------------------------------------------------------------
+# Dissolve helper (unchanged logic)
+# ------------------------------------------------------------
 def dissolve_vector_to_geom(path, layer_name="flood", dissolve_batch=5000):
-    """
-    Read polygons in batches from path:layer and return a single dissolved Shapely geometry.
-    Keeps memory bounded by dissolving incrementally.
-    """
     if not os.path.exists(path):
         logging.warning(f"Dissolve skipped: file not found: {path}")
         return None
-
-    # Ensure layer exists
     try:
         layers = fiona.listlayers(path)
         if layer_name not in layers:
@@ -656,8 +632,6 @@ def dissolve_vector_to_geom(path, layer_name="flood", dissolve_batch=5000):
     except Exception as e:
         logging.error(f"Failed listing layers for {path}: {e}")
         return None
-
-    # Early-out empty layer?
     try:
         with fiona.open(path, "r", layer=layer_name) as src:
             n_src = len(src)
@@ -676,8 +650,7 @@ def dissolve_vector_to_geom(path, layer_name="flood", dissolve_batch=5000):
                 if not geom.is_empty:
                     batch.append(geom)
                 if len(batch) >= dissolve_batch:
-                    unions.append(unary_union(batch))
-                    batch = []
+                    unions.append(unary_union(batch)); batch = []
             if batch:
                 unions.append(unary_union(batch))
     except Exception as e:
@@ -689,17 +662,15 @@ def dissolve_vector_to_geom(path, layer_name="flood", dissolve_batch=5000):
         return None
 
     final = unary_union(unions)
-    final = _normalize_to_polygonal(final, crs="EPSG:4326") or final
-    logging.info(f"Dissolve OK for {path}:{layer_name} → valid={getattr(final,'is_valid',None)}, empty={getattr(final,'is_empty',None)}")
+    final = _normalize_to_polygonal(final, crs=WGS84) or final
+    logging.info(f"Dissolve OK → valid={getattr(final,'is_valid',None)}, empty={getattr(final,'is_empty',None)}")
     return final
-
 
 def _bands_from_center(height_m, pct_low=0.2, pct_high=0.2):
     return max(0.0, height_m * (1.0 - pct_low)), height_m, height_m * (1.0 + pct_high)
 
-
 # ------------------------------------------------------------
-# Build inundation per (event, ISO)
+# Build inundation per (event, ISO) with country-coastal ROI
 # ------------------------------------------------------------
 @profile
 def build_tsunami_inundation(
@@ -714,20 +685,12 @@ def build_tsunami_inundation(
     dem_tile_size_deg: int = 5,
     tmp_dir: str | None = None,
     keep_temp: bool = False,
-    # fast/skip controls for streaming
-    stream_to_disk: bool = False,       # False = in-memory unions; True = write temp GPKGs and dissolve
+    stream_to_disk: bool = False,       # False = in-memory unions
     polygon_min_area_m2: float = 5000.0,
     min_preview_hits: int = 8,
     min_valid_pixels: int = 200,
-    simplify_m_stream: float = 0.0,     # optional simplify per-block (meters)
+    simplify_m_stream: float = 0.0,
 ):
-    """
-    Returns GeoDataFrame with bands {LOW, MED, HIGH}.
-    If use_dem and local tiles available:
-      - Default (fast): tile unions & final union are done in memory (no temp files).
-      - Legacy: stream to temp GPKG and dissolve on disk (stream_to_disk=True).
-    Otherwise → slope-based coastline buffers (no DEM).
-    """
     tmp_dir = tmp_dir or tempfile.gettempdir()
 
     r = runups_gdf.copy()
@@ -736,13 +699,18 @@ def build_tsunami_inundation(
     if r.empty:
         return gpd.GeoDataFrame(
             columns=["event_id", "band", "ru_center", "ru_low", "ru_high", "num_points", "method", "geometry"],
-            crs="EPSG:4326", geometry="geometry"
+            crs=WGS84, geometry="geometry"
         )
 
     if r.geometry.name != "geometry":
-        r = gpd.GeoDataFrame(r, geometry=gpd.points_from_xy(r["longitude"], r["latitude"]), crs="EPSG:4326")
+        r = gpd.GeoDataFrame(r, geometry=gpd.points_from_xy(r["longitude"], r["latitude"]), crs=WGS84)
 
-    coast = coast_gdf.to_crs("EPSG:4326")
+    # Enforce tsunami use-case: max inland band of 1 km (configurable)
+    max_inland_km = DEFAULT_MAX_INLAND_KM
+    inland_limit_km = float(min(inland_limit_km, max_inland_km))
+
+    # Country polygons (already filtered to ISO outside)
+    coast = coast_gdf.to_crs(WGS84)
 
     # Snap & IDW alongshore
     snapped, coast_line = _snap_points_to_coast(r, coast)
@@ -757,7 +725,7 @@ def build_tsunami_inundation(
         return gpd.GeoDataFrame([{
             "event_id": event_id, "band": "MED", "ru_center": np.nan, "ru_low": np.nan, "ru_high": np.nan,
             "num_points": 0, "method": "points_hull_1mile", "geometry": hull
-        }], crs="EPSG:4326")
+        }], crs=WGS84)
 
     coast_samples = _idw_alongshore(snapped, coast_line)
     if coast_samples.empty:
@@ -767,9 +735,9 @@ def build_tsunami_inundation(
         return gpd.GeoDataFrame([{
             "event_id": event_id, "band": "MED", "ru_center": np.nan, "ru_low": np.nan, "ru_high": np.nan,
             "num_points": len(snapped), "method": "points_hull_1mile", "geometry": hull
-        }], crs="EPSG:4326")
+        }], crs=WGS84)
 
-    # Representative runup height (meters a.s.l., EGM96)
+    # Representative runup height (m, EGM96)
     try:
         ru_center = float(np.nanmedian(coast_samples["ru_m"]))
     except Exception:
@@ -781,112 +749,74 @@ def build_tsunami_inundation(
     low_pct, high_pct = band_percents
     ru_low = max(0.0, ru_center * (1.0 - low_pct))
     ru_high = ru_center * (1.0 + high_pct)
-
     logging.info(f"Runup bands (m): LOW={ru_low:.3f}, MED={ru_center:.3f}, HIGH={ru_high:.3f}")
 
-    # Coastal strip (compute BEFORE tile selection)
-    strip_m = _coastal_strip(coast_line.to_crs("EPSG:3857").iloc[0], width_m=2000)
-    strip_wgs = gpd.GeoSeries([strip_m], crs="EPSG:3857").to_crs("EPSG:4326").iloc[0]
+    # Country union & ROI (country ∩ coastline buffer(inland_limit_km))
+    country_union = unary_union(list(coast.geometry))
+    strip_wgs, roi_wgs = _compute_roi(coast_line, country_union, inland_limit_km)
 
-    # Find intersecting tiles (no in-memory mosaic)
+    # Thin “touch” rim the polygons must intersect (e.g., 200 m)
+    coast_touch_wgs = _build_coast_touch_band(coast_line, DEFAULT_COAST_TOUCH_M)
+
+    # DEM tiles (index promotion + safe selection by ROI)
     tiles = gpd.GeoDataFrame()
     if use_dem and dem_local_root:
         try:
-            index_gdf = build_local_dem_index(
+            index_df = build_local_dem_index(
                 dem_local_root,
                 tile_size_deg=dem_tile_size_deg,
                 suffix=('_elv_tiled.tif', '_elv.tif', '.tif')
             )
-            _log_df_schema("DEM index (raw)", index_gdf)
+            # DEBUG: write schema snapshot
+            try:
+                dbg_path = os.path.join(tmp_dir or tempfile.gettempdir(), "dem_index_debug.csv")
+                pd.DataFrame(index_df).to_csv(dbg_path, index=False)
+                logging.info(f"[DEM index] wrote schema snapshot to {dbg_path}")
+            except Exception:
+                pass
 
-            # Manually choose the geometry column
-            # 1) quick pick, if present
-            if isinstance(index_gdf, gpd.GeoDataFrame):
-                geom_col = getattr(getattr(index_gdf, "geometry", None), "name", None)
-                if geom_col not in getattr(index_gdf, "columns", []):
-                    geom_col = None
-            else:
-                geom_col = None
-
-            # 2) fallback: try common names, then detect
-            if geom_col is None:
-                for cand in ("geometry", "geom", "GEOMETRY", "Geom", "wkt", "WKT"):
-                    if cand in index_gdf.columns:
-                        geom_col = cand
-                        break
-            if geom_col is None:
-                # last-resort sniff: pick first column that looks shapely/geojson/WKT
-                for c in index_gdf.columns:
-                    s = pd.Series(index_gdf[c]).dropna()
-                    if s.empty: 
-                        continue
-                    v = s.iloc[0]
-                    if hasattr(v, "geom_type"):
-                        geom_col = c; break
-                    if isinstance(v, dict) and "type" in v and "coordinates" in v:
-                        geom_col = c; break
-                    if isinstance(v, str) and v[:6].upper() in ("POINT(", "LINEST", "POLYGO", "MULTIP", "GEOMET"):
-                        geom_col = c; break
-
-            if geom_col is None:
-                raise ValueError("Could not locate a geometry column in the DEM index.")
-
-            logging.info(f"[DEM index] using geometry column: {geom_col!r}")
-
-            # Promote to GeoDataFrame safely
-            index_gdf = _activate_geometry_column(index_gdf, geom_col=geom_col, crs="EPSG:4326")
-            _log_df_schema("DEM index (activated)", index_gdf)
-
-            index_gdf = _ensure_gdf(index_gdf)
+            index_gdf = _promote_dem_index(index_df, dem_tile_size_deg=dem_tile_size_deg)
             logging.info(
                 f"DEM index: crs={index_gdf.crs}, geom_col={index_gdf.geometry.name}, "
                 f"cols={list(index_gdf.columns)} n={len(index_gdf)}"
             )
-
-            tiles = _safe_select_tiles(index_gdf, strip_wgs)
+            tiles = _safe_select_tiles(index_gdf, roi_wgs)
             logging.info(f"Selected {len(tiles)} DEM tiles for event {event_id}")
-
             if tiles.empty:
-                logging.warning(f"No local DEM tiles intersect coastal strip (event {event_id}); using fallback buffers.")
+                logging.warning(f"No local DEM tiles intersect country-coastal ROI (event {event_id}); fallback buffers.")
         except Exception as e:
             logging.warning(f"Local DEM tile search failed (event {event_id}): {e}")
-
 
     results = []
 
     # --- DEM streaming branch ---
     if use_dem and not tiles.empty:
-        # iterate three bands
         for band, thr in [("LOW", ru_low), ("MED", ru_center), ("HIGH", ru_high)]:
             Hmax = float(thr) + 1.5
             logging.info(f"[BAND {band}] Hmax={Hmax:.2f} m a.s.l.")
 
-            dissolved = None
-
             if stream_to_disk:
-                # legacy on-disk temp path for debugging/inspection
                 tmp_gpkg = os.path.join(tmp_dir, f"_tmp_flood_{event_id}_{band}.gpkg")
                 first = True
 
                 for _, t in tiles.iterrows():
                     stream_flood_polygons_from_dem(
                         dem_path=t["path"],
-                        strip_wgs=strip_wgs,
-                        min_elev_m=-1.0,
+                        roi_wgs=roi_wgs,
+                        min_elev_m=-1.0,                  # MERIT oceans are -9999; -1..Hmax keeps land ≤ Hmax
                         max_elev_m=Hmax,
-                        inland_limit_km=inland_limit_km,
-                        tmp_vector_path=tmp_gpkg,
+                        tmp_vector_path=tmp_gpkg,         # or None in fast mode
                         layer_name="flood",
                         simplify_m=simplify_m_stream,
                         min_area_m2=polygon_min_area_m2,
-                        mode=("w" if first else "a"),
+                        mode=("w" if first else "a"),     # if streaming to disk
                         min_preview_hits=min_preview_hits,
                         min_valid_pixels=min_valid_pixels,
-                        return_union=False
+                        return_union=False,
+                        coast_touch_wgs=coast_touch_wgs    # ensure sea connectivity
                     )
                     first = False
 
-                # Count features (informational)
                 n = 0
                 if os.path.exists(tmp_gpkg):
                     try:
@@ -902,60 +832,58 @@ def build_tsunami_inundation(
                 logging.info(f"[BAND {band}] Dissolve wall time: {(t1 - t0):.2f}s (features={n})")
 
                 if not keep_temp:
-                    try:
-                        os.remove(tmp_gpkg)
-                    except OSError:
-                        pass
+                    try: os.remove(tmp_gpkg)
+                    except OSError: pass
                 else:
                     logging.info(f"[KEEP_TEMP] Preserved temp flood layer: {tmp_gpkg}")
 
             else:
-                # FAST MODE: do not write temp files; union per-tile in memory
                 tile_geoms = []
                 for _, t in tiles.iterrows():
-                    g_tile = stream_flood_polygons_from_dem(
+                    g = stream_flood_polygons_from_dem(
                         dem_path=t["path"],
-                        strip_wgs=strip_wgs,
+                        roi_wgs=roi_wgs,
                         min_elev_m=-1.0,
                         max_elev_m=Hmax,
-                        inland_limit_km=inland_limit_km,
                         tmp_vector_path=None,
+                        layer_name="flood",
                         simplify_m=simplify_m_stream,
                         min_area_m2=polygon_min_area_m2,
                         min_preview_hits=min_preview_hits,
                         min_valid_pixels=min_valid_pixels,
-                        return_union=True
+                        return_union=True,
+                        coast_touch_wgs=coast_touch_wgs       # <-- FIX: also enforce in fast-mode
                     )
-                    if g_tile is not None and (not getattr(g_tile, "is_empty", False)):
-                        tile_geoms.append(g_tile)
+                    if g is not None and (not getattr(g, "is_empty", False)):
+                        tile_geoms.append(g)
 
+                dissolved = None
                 if tile_geoms:
                     try:
                         dissolved = unary_union(tile_geoms)
                     except Exception:
                         dissolved = unary_union([x for x in tile_geoms if (x is not None and not x.is_empty)])
 
-            # Choose dissolved or fallback; normalize to polygonal; optional sector clip
+            # Choose dissolved or fallback; normalize; optional sector clip
             if (dissolved is None) or (hasattr(dissolved, "is_empty") and dissolved.is_empty):
                 logging.warning(f"[BAND {band}] No dissolved geometry produced. Using fallback buffer.")
-                poly_wgs = coast_line.buffer(1609, cap_style=2).to_crs("EPSG:4326").iloc[0]
+                poly_wgs = coast_line.buffer(1609, cap_style=2).to_crs(WGS84).iloc[0]
             else:
-                poly_wgs = _normalize_to_polygonal(dissolved, crs="EPSG:4326")
+                poly_wgs = _normalize_to_polygonal(dissolved, crs=WGS84)
                 if poly_wgs is None or getattr(poly_wgs, "is_empty", True):
                     logging.warning(f"[BAND {band}] No polygonal dissolved geometry; using fallback buffer.")
-                    poly_wgs = coast_line.buffer(1609, cap_style=2).to_crs("EPSG:4326").iloc[0]
+                    poly_wgs = coast_line.buffer(1609, cap_style=2).to_crs(WGS84).iloc[0]
 
-            # one-time sector wedge clip
             if sector_source_pt is not None and not poly_wgs.is_empty:
                 poly_wgs = sector_clip(poly_wgs, strip_wgs.centroid, sector_source_pt,
                                        half_angle_deg=60, max_range_km=inland_limit_km)
 
             _diagnose_geom(f"dissolved-{band}", poly_wgs)
             try:
-                area_m2 = gpd.GeoSeries([poly_wgs], crs='EPSG:4326').to_crs('EPSG:3857').area.iloc[0]
+                area_m2 = gpd.GeoSeries([poly_wgs], crs=WGS84).to_crs('EPSG:3857').area.iloc[0]
                 logging.info(f"[BAND {band}] Area≈{area_m2:,.0f} m²")
-            except Exception as e:
-                logging.debug(f"[BAND {band}] area calc skipped: {e}")
+            except Exception:
+                pass
 
             results.append({
                 "event_id": event_id, "band": band,
@@ -966,9 +894,9 @@ def build_tsunami_inundation(
                 "geometry": poly_wgs
             })
 
-    # --- Fallback: no DEM (or no tiles) → slope-based buffers ---
+    # --- Fallback: no DEM → slope-based buffers (country masked) ---
     if not results:
-        slope = 0.015  # 1.5% nominal coastal slope
+        slope = 0.015
         D_med_km = float(np.clip(ru_center / max(slope, 1e-3) / 1000.0, 0.5, inland_limit_km))
         D_low_km = max(0.25, 0.8 * D_med_km)
         D_high_km = min(inland_limit_km, 1.2 * D_med_km)
@@ -976,7 +904,8 @@ def build_tsunami_inundation(
         line_m = coast_line.to_crs("EPSG:3857").iloc[0]
         for band_name, dist_km in [("LOW", D_low_km), ("MED", D_med_km), ("HIGH", D_high_km)]:
             poly_m = line_m.buffer(dist_km * 1000, cap_style=2)
-            poly = gpd.GeoSeries([poly_m], crs="EPSG:3857").to_crs("EPSG:4326").iloc[0]
+            poly = gpd.GeoDataFrame(geometry=[poly_m], crs="EPSG:3857").to_crs(WGS84).geometry.iloc[0]
+            poly = gpd.GeoSeries([poly], crs=WGS84).intersection(roi_wgs).iloc[0]
             if sector_source_pt is not None:
                 poly = sector_clip(poly, strip_wgs.centroid, sector_source_pt,
                                    half_angle_deg=60, max_range_km=inland_limit_km)
@@ -988,43 +917,34 @@ def build_tsunami_inundation(
                 "geometry": poly
             })
 
-    return gpd.GeoDataFrame(results, crs="EPSG:4326")
+    return gpd.GeoDataFrame(results, crs=WGS84)
 
-
+# ---------------------------
+# Write helpers
+# ---------------------------
 def _ensure_naive_datetime(series: pd.Series) -> pd.Series:
-    """Coerce to pandas datetime64[ns] and strip timezone (some drivers reject tz-aware)."""
     s = pd.to_datetime(series, errors="coerce")
     try:
-        # pandas Series.dt only exists for datetime dtype
         return s.dt.tz_localize(None)
     except Exception:
         return s
 
-
 def _prepare_for_write(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     g = gdf.copy()
-
-    # ensure active geometry + CRS
-    g = _activate_geometry_column(g, crs="EPSG:4326")
-
-    # drop empties/None up front
+    g = _activate_geometry_column(g, crs=WGS84)
     g = g[g.geometry.notna() & (~g.geometry.is_empty)].copy()
     if g.empty:
         return g
 
-    # try to ensure 2D (drop Z/M) & validity
     def _fix_geom(geom):
         if geom is None or geom.is_empty:
             return None
-        # 2.5D → 2D
         try:
             if hasattr(geom, "has_z") and geom.has_z:
                 from shapely.ops import transform
-                _2d = transform(lambda x, y, z=None: (x, y), geom)
-                geom = _2d
+                geom = transform(lambda x, y, z=None: (x, y), geom)
         except Exception:
             pass
-        # validity & precision
         try:
             from shapely import set_precision
             geom = set_precision(geom.buffer(0), grid_size=1e-8)
@@ -1034,19 +954,14 @@ def _prepare_for_write(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
     g["geometry"] = g.geometry.apply(_fix_geom)
     g = g[g.geometry.notna() & (~g.geometry.is_empty)]
-    # normalize datetime columns if present
     if "date" in g.columns:
         g["date"] = _ensure_naive_datetime(g["date"])
     return g
 
-
 def _write_vector(gdf: gpd.GeoDataFrame, path: str, driver: str, layer: str):
     g = _prepare_for_write(gdf)
-    _log_geom_mix("pre-only-polygons", g)
     if driver in ("FileGDB", "GPKG"):
         g = _only_polygons(g)
-    _log_geom_mix("pre-write", g)
-
     if g.empty:
         logging.warning(f"[write] Nothing to write for {path}:{layer} (empty GeoDataFrame).")
         return
@@ -1058,7 +973,7 @@ def _write_vector(gdf: gpd.GeoDataFrame, path: str, driver: str, layer: str):
             logging.info(f"[fiona] wrote {path} (driver={driver}, layer={layer})")
             return
         except Exception as e:
-            logging.warning(f"[fiona] primary GDB write failed, retrying with lower precision: {e}")
+            logging.warning(f"[fiona] GDB write failed, retry with precision reduction: {e}")
             try:
                 from shapely import set_precision
                 g2 = g.copy()
@@ -1068,7 +983,6 @@ def _write_vector(gdf: gpd.GeoDataFrame, path: str, driver: str, layer: str):
                 logging.info(f"[fiona] wrote (precision-reduced) {path} (driver={driver}, layer={layer})")
                 return
             except Exception as e2:
-                # write a debug GPKG for inspection before raising
                 try:
                     dbg = os.path.splitext(path)[0] + "__debug.gpkg"
                     g.to_file(dbg, driver="GPKG", layer=f"{layer}_debug")
@@ -1078,7 +992,6 @@ def _write_vector(gdf: gpd.GeoDataFrame, path: str, driver: str, layer: str):
                 logging.error(f"[fiona] GDB write retry failed: {e2}")
                 raise
 
-    # pyogrio for GPKG or other
     try:
         import pyogrio
         pyogrio.write_dataframe(g, path, driver=driver, layer=layer)
@@ -1089,7 +1002,6 @@ def _write_vector(gdf: gpd.GeoDataFrame, path: str, driver: str, layer: str):
             g.to_file(path, driver=driver, layer=layer, engine="fiona")
             logging.info(f"[fiona] wrote {path} (driver={driver}, layer={layer})")
         except Exception as e2:
-            # write a debug GPKG for inspection
             try:
                 dbg = os.path.splitext(path)[0] + "__debug.gpkg"
                 g.to_file(dbg, driver="GPKG", layer=f"{layer}_debug")
@@ -1098,16 +1010,15 @@ def _write_vector(gdf: gpd.GeoDataFrame, path: str, driver: str, layer: str):
                 logging.error(f"[debug] could not write debug GPKG: {e3}")
             raise
 
-
 # ------------------------------------------------------------
-# Top-level tsunami processor (optional parallel)
+# Top-level tsunami processor (per event, optional parallel)
 # ------------------------------------------------------------
 @profile
 def process_tsunami_data(
     tsunami_events_csv,
     tsunami_runups_csv,
     countries_path,
-    dem_dir,  # retained for signature compatibility (unused)
+    dem_dir,  # kept for signature compat (unused; use dem_local_root)
     inland_limit_km=10,
     band_percents=(0.2, 0.2),
     use_dem: bool = True,
@@ -1115,21 +1026,19 @@ def process_tsunami_data(
     dem_tile_size_deg: int = 5,
     output_folder: str | None = None,
     tmp_dir: str | None = None,
-    # NEW controls
-    event_filter: list | set | None = None,     # process only these event IDs
-    write_per_event: bool = False,              # write each (event, ISO) as it's produced
-    per_event_dir: str | None = None,           # defaults to <output_folder>/tsunami_events
-    per_event_format: str = "gpkg",             # "gpkg" or "gdb"
+    event_filter: list | set | None = None,
+    write_per_event: bool = False,
+    per_event_dir: str | None = None,
+    per_event_format: str = "gpkg",
     per_event_layer: str = "tsunami",
-    write_aggregate: bool = False,              # also write a combined file at the end
-    aggregate_path: str | None = None,          # defaults to <output_folder>/tsunamis_all.gpkg
-    # Performance knobs
-    stream_to_disk: bool = False,               # False = fast in-memory unions
+    write_aggregate: bool = False,
+    aggregate_path: str | None = None,
+    stream_to_disk: bool = False,
     polygon_min_area_m2: float = 5000.0,
     min_preview_hits: int = 8,
     min_valid_pixels: int = 200,
     simplify_m_stream: float = 0.0,
-    n_workers: int = 1                          # >1 to parallelize (experimental)
+    n_workers: int = 1
 ):
     dem_local_root = dem_local_root or DEFAULT_DEM_LOCAL_ROOT
     out_root = output_folder or "."
@@ -1144,7 +1053,6 @@ def process_tsunami_data(
     logging.info(f"Temp dir: {os.path.abspath(tmp_dir)}")
     logging.info(f"DEM_LOCAL_ROOT resolved to: {dem_local_root!r}")
 
-    # defaults for writing
     if write_per_event:
         per_event_dir = per_event_dir or os.path.join(out_root, "tsunami_events")
         os.makedirs(per_event_dir, exist_ok=True)
@@ -1179,14 +1087,14 @@ def process_tsunami_data(
     runups_gdf = gpd.GeoDataFrame(
         runups_df,
         geometry=gpd.points_from_xy(runups_df['longitude'], runups_df['latitude']),
-        crs="EPSG:4326"
+        crs=WGS84
     )
-    runups_gdf = _activate_geometry_column(runups_gdf, crs="EPSG:4326")
+    runups_gdf = _activate_geometry_column(runups_gdf, crs=WGS84)
 
     # countries (clean)
     try:
-        countries = gpd.read_file(countries_path).to_crs("EPSG:4326")
-        countries = _activate_geometry_column(countries, crs="EPSG:4326")
+        countries = gpd.read_file(countries_path).to_crs(WGS84)
+        countries = _activate_geometry_column(countries, crs=WGS84)
         try:
             from shapely.validation import make_valid
             countries["geometry"] = countries.geometry.apply(make_valid)
@@ -1207,14 +1115,13 @@ def process_tsunami_data(
         logging.exception("Failed loading countries for tsunamis")
         return gpd.GeoDataFrame()
 
-    # ISO assignment: intersects + nearest≤50km fallback
+    # ISO assignment: intersects + nearest≤50 km fallback
     try:
-        # intersects
         runups_iso = gpd.sjoin(
             runups_gdf, countries[[ISO_COL, "geometry"]],
             how="left", predicate="intersects"
         ).rename(columns={ISO_COL: "iso_a3"}).drop(columns="index_right")
-        runups_iso = _activate_geometry_column(runups_iso, crs="EPSG:4326")
+        runups_iso = _activate_geometry_column(runups_iso, crs=WGS84)
 
         need = runups_iso["iso_a3"].isna()
         n_need = int(need.sum())
@@ -1245,7 +1152,6 @@ def process_tsunami_data(
                         distance_col="dist_m", max_distance=50_000
                     ).rename(columns={ISO_COL: "iso_a3"})
                 except Exception:
-                    # fallback: nearest to representative points
                     right_pts = right_proj.copy()
                     right_pts["geometry"] = right_pts.geometry.representative_point()
                     nearest = gpd.sjoin_nearest(
@@ -1267,9 +1173,13 @@ def process_tsunami_data(
         )
     except Exception:
         logging.exception("ISO spatial-join/nearest failed for runups")
-        return gpd.GeoDataFrame()
+        return gpd.GeoDataFrame()   # <-- early return to avoid NameError later
 
-    # event dates
+    # group and run
+    results = []
+    grouped = runups_iso.groupby(['tsunamiEventId', 'iso_a3'], dropna=False)
+
+    # date helper
     def _mk_date(row):
         try:
             y = int(row.get('year')) if pd.notna(row.get('year')) else None
@@ -1278,20 +1188,18 @@ def process_tsunami_data(
             return pd.to_datetime(f"{y}-{m}-{d}", errors='coerce') if y else pd.NaT
         except Exception:
             return pd.NaT
-
     events_df['date'] = events_df.apply(_mk_date, axis=1)
 
-    # Helper to run one (event, ISO) group
-    def _run_group(event_id_val, iso_val, grp_df):
-        coast_sel = countries[countries[ISO_COL] == iso_val]
-        if coast_sel.empty:
-            logging.warning(f"No coast polygon for ISO {iso_val} (event {event_id_val}).")
+    def _run_group(event_id, iso, grp_df):
+        coast = countries[countries[ISO_COL] == iso]
+        if coast.empty:
+            logging.warning(f"No coast polygon for ISO {iso} (event {event_id}).")
             return gpd.GeoDataFrame()
 
         inund = build_tsunami_inundation(
             runups_gdf=grp_df[['latitude', 'longitude', 'runupHt', 'tsunamiEventId', 'geometry']],
-            coast_gdf=coast_sel,
-            event_id=event_id_val,
+            coast_gdf=coast,
+            event_id=event_id,
             inland_limit_km=inland_limit_km,
             band_percents=band_percents,
             use_dem=use_dem,
@@ -1307,50 +1215,43 @@ def process_tsunami_data(
         if inund.empty:
             return inund
 
-        ev = events_df[events_df['id'] == event_id_val]
-        inund['iso_a3'] = iso_val
+        ev = events_df[events_df['id'] == event_id]
+        inund['iso_a3'] = iso
         inund['event_type'] = 'tsunami'
         inund['date'] = ev.iloc[0]['date'] if not ev.empty else pd.NaT
         return inund
 
-    # iterate per (event_id, iso)
-    results = []
-    grouped = runups_iso.groupby(['tsunamiEventId', 'iso_a3'], dropna=False)
-
-    # SERIAL by default (n_workers=1)
     if n_workers <= 1:
-        for (event_id_val, iso_val), grp in grouped:
-            if pd.isna(event_id_val) or pd.isna(iso_val):
+        for (event_id, iso), grp in grouped:
+            if pd.isna(event_id) or pd.isna(iso):
                 continue
-            if event_filter is not None and event_id_val not in event_filter:
+            if event_filter is not None and event_id not in event_filter:
                 continue
 
-            # ensure grp is a proper GeoDataFrame with an active geometry
             if not isinstance(grp, gpd.GeoDataFrame):
-                grp = gpd.GeoDataFrame(grp, geometry="geometry", crs="EPSG:4326")
-            grp = _activate_geometry_column(grp, crs="EPSG:4326")
-            logging.info(f"Processing event {int(event_id_val)} / ISO {iso_val} with {len(grp)} runups")
-            inund = _run_group(event_id_val, iso_val, grp)
+                grp = gpd.GeoDataFrame(grp, geometry="geometry", crs=WGS84)
+            grp = _activate_geometry_column(grp, crs=WGS84)
+            logging.info(f"Processing event {int(event_id)} / ISO {iso} with {len(grp)} runups")
+            inund = _run_group(event_id, iso, grp)
             if inund.empty:
                 continue
 
-            # per-event write
             if write_per_event:
                 if per_event_format == "gpkg":
-                    out_path = os.path.join(per_event_dir, f"tsunami_{int(event_id_val)}_{iso_val}.gpkg")
+                    out_path = os.path.join(per_event_dir, f"tsunami_{int(event_id)}_{iso}.gpkg")
                     driver = "GPKG"; layer = per_event_layer
                 else:
-                    gdb_name = f"tsunami_{int(event_id_val)}_{iso_val}.gdb"
+                    gdb_name = f"tsunami_{int(event_id)}_{iso}.gdb"
                     out_path = os.path.join(per_event_dir, gdb_name)
                     driver = "FileGDB"; layer = per_event_layer
                     try:
                         if "FileGDB" not in getattr(fiona, "supported_drivers", {}):
                             logging.warning("FileGDB writer unavailable; writing GPKG instead.")
-                            out_path = os.path.join(per_event_dir, f"tsunami_{int(event_id_val)}_{iso_val}.gpkg")
+                            out_path = os.path.join(per_event_dir, f"tsunami_{int(event_id)}_{iso}.gpkg")
                             driver = "GPKG"
                     except Exception:
                         logging.warning("Could not verify Fiona drivers; using GPKG for safety.")
-                        out_path = os.path.join(per_event_dir, f"tsunami_{int(event_id_val)}_{iso_val}.gpkg")
+                        out_path = os.path.join(per_event_dir, f"tsunami_{int(event_id)}_{iso}.gpkg")
                         driver = "GPKG"
 
                 try:
@@ -1358,33 +1259,16 @@ def process_tsunami_data(
                     _write_vector(inund, out_path, driver=driver, layer=layer)
                     logging.info(f"Wrote per-event tsunami: {out_path} (layer={layer}, driver={driver})")
                 except Exception as e:
-                    logging.error(f"Failed writing per-event output for event {event_id_val}, {iso_val}: {e}")
-                    # debug dump
-                    try:
-                        dbg = os.path.join(per_event_dir, f"__debug_{int(event_id_val)}_{iso_val}.gpkg")
-                        gpd.GeoDataFrame(inund, geometry="geometry", crs="EPSG:4326").to_file(
-                            dbg, driver="GPKG", layer="debug"
-                        )
-                        logging.info(f"[debug] wrote {dbg}")
-                    except Exception as e2:
-                        logging.error(f"[debug] could not write debug gpkg: {e2}")
+                    logging.error(f"Failed writing per-event output for event {event_id}, {iso}: {e}")
 
             results.append(inund)
-
     else:
-        # PARALLEL (experimental): to avoid heavy pickles, run serially for writing
         from concurrent.futures import ProcessPoolExecutor, as_completed
-
-        # Prepare tasks as small dataframes (grp.copy()) – expect moderate sizes per group
         tasks = [((int(eid), iso), grp.copy()) for (eid, iso), grp in grouped
                  if (pd.notna(eid) and pd.notna(iso) and (event_filter is None or eid in event_filter))]
-
         logging.info(f"Dispatching {len(tasks)} (event, ISO) groups across {n_workers} workers...")
         with ProcessPoolExecutor(max_workers=n_workers) as ex:
-            futs = []
-            for (eid_iso, grp_df) in tasks:
-                eid, iso_val = eid_iso
-                futs.append(ex.submit(_run_group, eid, iso_val, grp_df))
+            futs = [ex.submit(_run_group, eid, iso, grp_df) for (eid, iso), grp_df in tasks]
             for f in as_completed(futs):
                 try:
                     res = f.result()
@@ -1393,55 +1277,41 @@ def process_tsunami_data(
                 except Exception as e:
                     logging.error(f"Worker failed: {e}")
 
-        # Per-event writes (do AFTER gather to avoid file locks)
         if write_per_event:
             for inund in results:
                 eid = int(inund["event_id"].iloc[0])
-                iso_val = inund["iso_a3"].iloc[0]
+                iso = inund["iso_a3"].iloc[0]
                 if per_event_format == "gpkg":
-                    out_path = os.path.join(per_event_dir, f"tsunami_{eid}_{iso_val}.gpkg")
+                    out_path = os.path.join(per_event_dir, f"tsunami_{eid}_{iso}.gpkg")
                     driver = "GPKG"; layer = per_event_layer
                 else:
-                    gdb_name = f"tsunami_{eid}_{iso_val}.gdb"
+                    gdb_name = f"tsunami_{eid}_{iso}.gdb"
                     out_path = os.path.join(per_event_dir, gdb_name)
                     driver = "FileGDB"; layer = per_event_layer
                     try:
                         if "FileGDB" not in getattr(fiona, "supported_drivers", {}):
                             logging.warning("FileGDB writer unavailable; writing GPKG instead.")
-                            out_path = os.path.join(per_event_dir, f"tsunami_{eid}_{iso_val}.gpkg")
+                            out_path = os.path.join(per_event_dir, f"tsunami_{eid}_{iso}.gpkg")
                             driver = "GPKG"
                     except Exception:
                         logging.warning("Could not verify Fiona drivers; using GPKG for safety.")
-                        out_path = os.path.join(per_event_dir, f"tsunami_{eid}_{iso_val}.gpkg")
+                        out_path = os.path.join(per_event_dir, f"tsunami_{eid}_{iso}.gpkg")
                         driver = "GPKG"
-
                 try:
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     _write_vector(inund, out_path, driver=driver, layer=layer)
                     logging.info(f"Wrote per-event tsunami: {out_path} (layer={layer}, driver={driver})")
                 except Exception as e:
-                    logging.error(f"Failed writing per-event output for event {eid}, {iso_val}: {e}")
-                    # debug dump
-                    try:
-                        dbg = os.path.join(per_event_dir, f"__debug_{eid}_{iso_val}.gpkg")
-                        gpd.GeoDataFrame(inund, geometry="geometry", crs="EPSG:4326").to_file(
-                            dbg, driver="GPKG", layer="debug"
-                        )
-                        logging.info(f"[debug] wrote {dbg}")
-                    except Exception as e2:
-                        logging.error(f"[debug] could not write debug gpkg: {e2}")
+                    logging.error(f"Failed writing per-event output for event {eid}, {iso}: {e}")
 
-    # nothing produced
     if not results:
         logging.warning("No tsunami inundation polygons produced.")
         return gpd.GeoDataFrame()
 
-    # aggregate in-memory
-    out = gpd.GeoDataFrame(pd.concat(results, ignore_index=True), crs="EPSG:4326")
-    out = _activate_geometry_column(out, crs="EPSG:4326")
-    logging.info(f"Produced {len(out)} tsunami polygons (combined).")
+    out = gpd.GeoDataFrame(pd.concat(results, ignore_index=True), crs=WGS84)
+    out = _activate_geometry_column(out, crs=WGS84)
+    logging.info(f"Produced {len(out):,} tsunami polygons (combined).")
 
-    # optional combined write
     if write_aggregate and aggregate_path:
         try:
             driver = "GPKG"

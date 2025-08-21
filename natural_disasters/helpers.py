@@ -30,6 +30,10 @@ AGENCY_PREF = ['USA','BOM','REUNION','TOKYO','CMA','HKO','KMA','NADI']
 RAD_TIERS   = ['R64','R50','R34']
 QUADS       = ['NE','SE','SW','NW']
 WGS84 = "EPSG:4326"
+CANON_COLS = [
+    "event_id", "event_type", "start_time", "end_time",
+    "band", "geom_method", "geom_confidence", "area_km2", "geometry"
+]
 
 # Natural Earth: EU-harmonized ISO3, avoids pseudo-codes like CH1/FR1
 ISO_COL = "ISO_A3_EH"
@@ -436,6 +440,223 @@ def write_single_hazard_gdb(
             pyogrio.write_dataframe(df, output_path, driver="GPKG", layer=layer_name, layer_options=["SPATIAL_INDEX=YES"])
         else:
             df.to_file(output_path, driver="GPKG", layer=layer_name)
+
+# --- unifed additions
+def _ensure_cols(gdf, cols):
+    for c in cols:
+        if c not in gdf.columns:
+            gdf[c] = None
+    return gdf
+
+def _area_km2(geom):
+    try:
+        return gpd.GeoSeries([geom], crs="EPSG:4326").to_crs("EPSG:3857").area.iloc[0] / 1e6
+    except Exception:
+        return None
+
+def unify_schema_storms(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    if gdf.empty: return gdf
+    out = gdf.copy()
+    if "SID" in out.columns:
+        out = out.rename(columns={"SID": "event_id"})
+    out["event_type"] = "storm"
+    out = _ensure_cols(out, ["geom_method","geom_confidence","start_time","end_time","storm_date"])
+    out["start_time"] = out["start_time"].fillna(out["storm_date"])
+    out["end_time"]   = out["end_time"].fillna(out["storm_date"])
+    out["band"] = None
+    out["area_km2"] = out.geometry.apply(_area_km2)
+    out = _ensure_cols(out, CANON_COLS)
+    return out[CANON_COLS]
+
+def unify_schema_quakes(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    if gdf.empty: return gdf
+    out = gdf.copy()
+    if "event_id" not in out.columns:
+        out["event_id"] = (out["id"].astype(str) if "id" in out.columns else out.index.astype(str))
+    out["event_type"] = "earthquake"
+    dt = out.get("eq_date", out.get("date"))
+    out["start_time"] = dt
+    out["end_time"]   = dt
+    out["band"] = None
+    out["geom_method"] = None
+    out["geom_confidence"] = None
+    out["area_km2"] = out.geometry.apply(_area_km2)
+    out = _ensure_cols(out, CANON_COLS)
+    return out[CANON_COLS]
+
+def unify_schema_tsunamis(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    if gdf.empty: return gdf
+    out = gdf.copy()
+    out["event_type"] = "tsunami"
+    out = _ensure_cols(out, ["start_time","end_time","band"])
+    if "method" in out.columns and "geom_method" not in out.columns:
+        out["geom_method"] = out["method"]
+    out["geom_confidence"] = None
+    out["area_km2"] = out.geometry.apply(_area_km2)
+    out = _ensure_cols(out, CANON_COLS)
+    return out[CANON_COLS]
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    p1 = np.radians(lat1); p2 = np.radians(lat2)
+    dlat = p2 - p1
+    dlon = np.radians(lon2 - lon1)
+    a = np.sin(dlat/2.0)**2 + np.cos(p1)*np.cos(p2)*np.sin(dlon/2.0)**2
+    return 2*R*np.arcsin(np.sqrt(a))
+
+def _centroid_latlon(gdf: gpd.GeoDataFrame):
+    if gdf.empty: return (np.array([]), np.array([]))
+    c = gdf.geometry.centroid.to_crs("EPSG:4326")
+    return np.array(c.y), np.array(c.x)
+
+def spatial_temporal_filter(
+    gdf: gpd.GeoDataFrame,
+    em: pd.DataFrame,
+    gdf_start: str, gdf_end: str,
+    em_start: str = "start_date", em_end: str = "end_date",
+    gdf_lat: str = None, gdf_lon: str = None,
+    em_lat: str = "em_lat", em_lon: str = "em_lon",
+    max_km: float = 250.0
+) -> gpd.GeoDataFrame:
+    """Keep rows whose time windows overlap any EM-DAT row and (if lat/lon available) are within max_km."""
+    if gdf.empty or em.empty: return gdf
+    g = gdf.copy()
+    g[gdf_start] = pd.to_datetime(g[gdf_start], errors="coerce")
+    g[gdf_end]   = pd.to_datetime(g[gdf_end], errors="coerce")
+    em = em.copy()
+    em[em_start] = pd.to_datetime(em[em_start], errors="coerce")
+    em[em_end]   = pd.to_datetime(em[em_end], errors="coerce")
+
+    if gdf_lat is None or gdf_lon is None:
+        clat, clon = _centroid_latlon(g)
+    else:
+        clat = pd.to_numeric(g[gdf_lat], errors="coerce").values
+        clon = pd.to_numeric(g[gdf_lon], errors="coerce").values
+
+    if em_lat not in em.columns:
+        for a in ["em_lat","latitude","lat","LAT","Lat"]:
+            if a in em.columns: em_lat = a; break
+    if em_lon not in em.columns:
+        for o in ["em_lon","longitude","lon","LON","Lon","LONGITUDE"]:
+            if o in em.columns: em_lon = o; break
+
+    keep_idx = []
+    have_em_ll = (em_lat in em.columns) and (em_lon in em.columns)
+    for i, row in g.iterrows():
+        st, et = row[gdf_start], row[gdf_end]
+        if pd.isna(st) or pd.isna(et): continue
+        overlaps = (em[em_start] <= et) & (em[em_end] >= st)
+        if not overlaps.any(): continue
+        if have_em_ll and len(clat) > 0 and len(clon) > 0:
+            lat0 = float(clat[i % len(clat)]) if len(clat) else np.nan
+            lon0 = float(clon[i % len(clon)]) if len(clon) else np.nan
+            if not (np.isnan(lat0) or np.isnan(lon0)):
+                sub = em.loc[overlaps, [em_lat, em_lon]].dropna()
+                if not sub.empty:
+                    d = haversine_km(lat0, lon0, sub[em_lat].values, sub[em_lon].values)
+                    if (d <= max_km).any():
+                        keep_idx.append(i)
+                        continue
+        keep_idx.append(i)
+    return g.loc[keep_idx]
+
+def audit_emdat_matches(
+    kept_gdf: gpd.GeoDataFrame,
+    emdat_df: pd.DataFrame,
+    gdf_start: str, gdf_end: str,
+    gdf_lat: str = None, gdf_lon: str = None,
+    em_start: str = "start_date", em_end: str = "end_date",
+    em_lat: str = "em_lat", em_lon: str = "em_lon",
+    max_km: float = 250.0,
+) -> set:
+    """
+    Return a set of EM-DAT DataFrame index values that match at least one kept feature
+    by temporal overlap and (if available) lat/lon proximity.
+    """
+    if kept_gdf.empty or emdat_df.empty:
+        return set()
+
+    g = kept_gdf.copy()
+    g[gdf_start] = pd.to_datetime(g[gdf_start], errors="coerce")
+    g[gdf_end]   = pd.to_datetime(g[gdf_end], errors="coerce")
+
+    em = emdat_df.copy()
+    em[em_start] = pd.to_datetime(em[em_start], errors="coerce")
+    em[em_end]   = pd.to_datetime(em[em_end], errors="coerce")
+
+    # GDF lat/lon
+    if gdf_lat is None or gdf_lon is None:
+        glat, glon = _centroid_latlon(g)
+    else:
+        glat = pd.to_numeric(g[gdf_lat], errors="coerce").values
+        glon = pd.to_numeric(g[gdf_lon], errors="coerce").values
+
+    # EM-DAT lat/lon detection
+    if em_lat not in em.columns:
+        for a in ["em_lat","latitude","lat","LAT","Lat"]:
+            if a in em.columns: em_lat = a; break
+    if em_lon not in em.columns:
+        for o in ["em_lon","longitude","lon","LON","Lon","LONGITUDE"]:
+            if o in em.columns: em_lon = o; break
+
+    have_em_ll = (em_lat in em.columns) and (em_lon in em.columns)
+    matched_idx = set()
+
+    for i, prow in g.iterrows():
+        st, et = prow[gdf_start], prow[gdf_end]
+        if pd.isna(st) or pd.isna(et):
+            continue
+        temporal = (em[em_start] <= et) & (em[em_end] >= st)
+        if not temporal.any():
+            continue
+
+        idxs = em.index[temporal]
+        if have_em_ll and len(glat) > 0 and len(glon) > 0:
+            lat0 = float(glat[i % len(glat)]) if len(glat) else np.nan
+            lon0 = float(glon[i % len(glon)]) if len(glon) else np.nan
+            if not (np.isnan(lat0) or np.isnan(lon0)):
+                sub = em.loc[idxs, [em_lat, em_lon]].dropna()
+                if not sub.empty:
+                    d = haversine_km(lat0, lon0, sub[em_lat].values, sub[em_lon].values)
+                    matched_idx.update(sub.index[(d <= max_km)])
+                    continue
+        matched_idx.update(idxs)  # fallback: temporal-only if no lat/lon
+    return matched_idx
+
+def write_exclusions(
+    output_folder: str,
+    emdat_df: pd.DataFrame,
+    matched_em_idx: set,
+    storms_before: gpd.GeoDataFrame, storms_after: gpd.GeoDataFrame,
+    quakes_before: gpd.GeoDataFrame,  quakes_after: gpd.GeoDataFrame,
+    tsu_before: gpd.GeoDataFrame,     tsu_after: gpd.GeoDataFrame,
+):
+    """Write: (1) unmatched/matched EM-DAT CSVs, (2) excluded features per hazard to a GPKG."""
+    os.makedirs(output_folder, exist_ok=True)
+    # 1) EM-DAT audit CSVs
+    try:
+        emdat_df.assign(__idx=emdat_df.index).to_csv(os.path.join(output_folder, "audit_emdat_all.csv"), index=False)
+        em_matched   = emdat_df.loc[list(matched_em_idx)]
+        em_unmatched = emdat_df.drop(index=list(matched_em_idx), errors="ignore")
+        em_matched.to_csv(os.path.join(output_folder, "audit_emdat_matched.csv"), index=False)
+        em_unmatched.to_csv(os.path.join(output_folder, "audit_emdat_unmatched.csv"), index=False)
+    except Exception as e:
+        logging.warning(f"Failed writing EM-DAT audit CSVs: {e}")
+
+    # 2) Excluded features per hazard
+    gpkg = os.path.join(output_folder, "audit_excluded.gpkg")
+    try:
+        if storms_before is not None and hasattr(storms_before, "empty") and not storms_before.empty:
+            excl = storms_before.loc[storms_before.index.difference(storms_after.index if not storms_after.empty else [])]
+            if not excl.empty: excl.to_file(gpkg, layer="storms_excluded", driver="GPKG")
+        if quakes_before is not None and hasattr(quakes_before, "empty") and not quakes_before.empty:
+            excl = quakes_before.loc[quakes_before.index.difference(quakes_after.index if not quakes_after.empty else [])]
+            if not excl.empty: excl.to_file(gpkg, layer="earthquakes_excluded", driver="GPKG")
+        if tsu_before is not None and hasattr(tsu_before, "empty") and not tsu_before.empty:
+            excl = tsu_before.loc[tsu_before.index.difference(tsu_after.index if not tsu_after.empty else [])]
+            if not excl.empty: excl.to_file(gpkg, layer="tsunamis_excluded", driver="GPKG")
+    except Exception as e:
+        logging.warning(f"Failed writing excluded features GPKG: {e}")
 
 # ---- writer: combined -> GDB (storms + quakes + tsunamis) ----
 def combine_disasters_to_gdb(
