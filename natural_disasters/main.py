@@ -5,18 +5,18 @@ import os, sys, logging
 import pandas as pd
 import geopandas as gpd
 from dotenv import load_dotenv
+from .helpers import setup_logging, write_single_hazard_gdb, combine_disasters_to_gdb, data_path, output_path
+from .storms import process_ibtracs_data
+from .quakes import process_earthquake_data
+from .tsunamis import process_tsunami_data
 
+os.environ.setdefault("GDAL_DATA", r"C:\OSGeo4W\share\gdal")
+os.environ.setdefault("PROJ_LIB",  r"C:\OSGeo4W\share\proj")
 
 load_dotenv()  
 DEM_LOCAL_ROOT = os.getenv("DEM_LOCAL_ROOT", None)
 if __name__ == "__main__" and __package__ is None:
     sys.path.append(os.path.dirname(__file__))
-
-from .helpers import setup_logging, write_single_hazard_gdb, combine_disasters_to_gdb
-from .storms import process_ibtracs_data
-from .quakes import process_earthquake_data
-from .tsunamis import process_tsunami_data
-
 
 def has_temporal_overlap(ib_start, ib_end, em_start, em_end, tolerance_days=7):
     if pd.isna(ib_start) or pd.isna(ib_end) or pd.isna(em_start) or pd.isna(em_end):
@@ -58,12 +58,12 @@ def main(
     run_storms: bool = False,
     run_earthquakes: bool = False,
     run_tsunamis: bool = True,
-    ibtracs_file: str = "ibtracs.ALL.list.v04r01.csv",
-    earthquake_file: str = "earthquakes.csv",
-    tsunami_events_file: str = "tsunami_events_filtered.csv",
-    tsunami_runups_file: str = "tsunami_runups_filtered.csv",
+    ibtracs_file: str = data_path("ibtracs.ALL.list.v04r01.csv"),
+    earthquake_file: str = data_path("earthquakes.csv"),
+    tsunami_events_file: str = data_path("tsunami_events_filtered.csv"),
+    tsunami_runups_file: str = data_path("tsunami_runups_filtered.csv"),
     dem_dir: str = "dem_by_iso",
-    emdat_file: str = "Top5EMDAT.csv",
+    emdat_file: str = data_path("Top 5 Percent EMDAT.csv"),
     countries_path: str = os.path.join("ne_10m_admin_0_countries", "ne_10m_admin_0_countries.shp"),
     output_folder: str = "disaster_output",
     fallback_path: str = "disaster_output/fallback_layers",
@@ -116,18 +116,22 @@ def main(
             logging.info(f"Earthquakes after EM-DAT filtering: {len(earthquake_gdf)}")
 
     # --- TSUNAMIS ---
-    tsunami_gdf = gpd.GeoDataFrame()
-    if run_tsunamis:
-        tsunami_gdf = process_tsunami_data(
-            tsunami_events_file,
-            tsunami_runups_file,
-            countries_path=countries_path,
-            dem_dir= None,
-            use_dem=True,                         
-            dem_local_root=DEM_LOCAL_ROOT,                  
-            dem_tile_size_deg=5,       
-            tmp_dir=output_folder,
-        )
+    tsunami_gdf = process_tsunami_data(
+        tsunami_events_file,
+        tsunami_runups_file,
+        countries_path=countries_path,
+        dem_dir=None,
+        use_dem=True,
+        dem_local_root=DEM_LOCAL_ROOT,
+        dem_tile_size_deg=5,
+        output_folder=output_folder,
+        tmp_dir=output_folder,
+        write_per_event=True,
+        per_event_format="gpkg",              # or "gdb"
+        write_aggregate=True,
+        aggregate_path=os.path.join(output_folder, "tsunamis_all.gpkg"),
+    )
+
 
     # --- WRITE PER-HAZARD GDBs (single-hazard writer) ---
     if run_storms and not storm_gdf.empty:

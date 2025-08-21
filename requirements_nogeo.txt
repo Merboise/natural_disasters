@@ -1,0 +1,9 @@
+# Core
+numpy>=1.25
+pandas>=2.0
+python-dotenv
+
+# Raster + DEM work
+
+# Optional niceties
+tqdm>=4.66

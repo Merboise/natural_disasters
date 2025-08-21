@@ -20,3 +20,19 @@ To enable DEM usage in the pipeline, run `main.py` with:
 - `run_tsunamis=True`
 - `use_dem=True`
 - `dem_local_root="C:\\Users\\<YOU>\\...\\Elevation"`
+
+# Data folder (not tracked in git)
+
+Place required datasets here:
+
+- `Top 5 Percent EMDAT.csv` – your EM-DAT subset/export
+- `DFO/FloodArchive_region.shp` (plus .dbf/.shx/.prj) – DFO polygons
+- `USFD/USFD_v1.0.csv` – USFD events
+- `HANZE/hanze_regions.shp` + `HANZE/hanze_events.csv` – HANZE data
+- `DEM/…` – local DEM tiles (GeoTIFFs)
+- `GHSL/GHS_POP_2020.tif` – GHSL population
+
+You can override the data location with an environment variable:
+
+```bash
+export NATDIS_DATA_DIR=/absolute/path/to/data

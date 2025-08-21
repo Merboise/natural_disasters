@@ -11,8 +11,7 @@ dist/
 .venv/
 venv/
 .env
-.env.*
-ibtracs.ALL.list.v04r01.csv
+onetime/
 
 # Notebooks / editors
 .ipynb_checkpoints/

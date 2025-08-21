@@ -1,19 +1,35 @@
 # ----
 # helpers.py (constants, logging, geometry helpers, optional ISO/time joins, GDB writers)
 # ----
-import os, sys, logging, psutil
+import os, sys, logging, psutil, math
 import pandas as pd
 import geopandas as gpd
 import numpy as np
 from typing import Optional
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
-from shapely.validation import explain_validity
+from shapely.ops import transform as shp_transform
+from shapely.validation import explain_validity, make_valid
+from pathlib import Path
+
+try:
+    import pyogrio
+    HAVE_PYOGRIO = True
+except Exception:
+    HAVE_PYOGRIO = False
+
+try:
+    from shapely import set_precision as shp_set_precision
+    HAVE_PRECISION = True
+except Exception:
+    HAVE_PRECISION = False
+
 
 # ---- constants ----
 NM_TO_KM = 1.852
 AGENCY_PREF = ['USA','BOM','REUNION','TOKYO','CMA','HKO','KMA','NADI']
 RAD_TIERS   = ['R64','R50','R34']
 QUADS       = ['NE','SE','SW','NW']
+WGS84 = "EPSG:4326"
 
 # Natural Earth: EU-harmonized ISO3, avoids pseudo-codes like CH1/FR1
 ISO_COL = "ISO_A3_EH"
@@ -60,6 +76,31 @@ def log_mem(note=""):
     rss = p.memory_info().rss / (1024**3)
     logging.info(f"[MEM] {note} RSS={rss:.2f} GB")
 
+# ---- pathing ----
+# Base folder for local datasets (default: ./data). Can override via env var.
+DATA_DIR = Path(os.getenv("NATDIS_DATA_DIR", "data")).expanduser().resolve()
+
+def data_path(*parts: str) -> Path:
+    """
+    Build a path inside the data directory. Accepts either "a/b" or "a\\b".
+    Example: data_path("Top 5 Percent EMDAT.csv")
+             data_path("DFO", "FloodArchive_region.shp")
+    """
+    p = Path(parts[0])
+    for q in parts[1:]:
+        p = p / q
+    return (DATA_DIR / p).resolve()
+
+# Optional: outputs go here by default
+OUTPUT_DIR = Path(os.getenv("NATDIS_OUTPUT_DIR", "disaster_output")).expanduser().resolve()
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def output_path(*parts: str) -> Path:
+    p = Path(parts[0])
+    for q in parts[1:]:
+        p = p / q
+    return (OUTPUT_DIR / p).resolve()
+
 # ---- small utils ----
 def bounds_ok(lat: float, lon: float) -> bool:
     return (-90 <= lat <= 90) and (-180 <= lon <= 180)
@@ -95,6 +136,109 @@ def build_circle(lat, lon, radius_nm, points=180) -> Optional[Polygon]:
         return Polygon(list(zip(xs, ys)))
     except Exception:
         return None
+
+def _coords_ok(g):
+    import numpy as np
+    if g is None or g.is_empty:
+        return False
+    try:
+        # Shapely 2.x
+        from shapely import get_coordinates
+        A = get_coordinates(g)
+    except Exception:
+        # Fallback for Shapely 1.8
+        def _poly_coords(poly):
+            from itertools import chain
+            xs = list(poly.exterior.coords)
+            for ring in poly.interiors:
+                xs += list(ring.coords)
+            return xs
+        import numpy as np
+        if g.geom_type == "Polygon":
+            A = np.array(_poly_coords(g), dtype=float)
+        elif g.geom_type == "MultiPolygon":
+            pts = []
+            for p in g.geoms:
+                pts.extend(_poly_coords(p))
+            A = np.array(pts, dtype=float) if pts else np.empty((0,2))
+        else:
+            try:
+                A = np.array(list(g.coords), dtype=float)
+            except Exception:
+                A = np.empty((0,2))
+
+    if A.size == 0:
+        return False
+    if not np.isfinite(A).all():
+        return False
+    x, y = A[:, 0], A[:, 1]
+    return (np.all(x >= -180.000001) and np.all(x <= 180.000001)
+            and np.all(y >= -90.000001) and np.all(y <= 90.000001))
+
+
+def _clean_for_fgdb(gdf):
+    import numpy as np
+    import geopandas as gpd
+    from shapely.geometry import MultiPolygon, Polygon
+    g = gdf.copy()
+
+    # 1) ensure polygons & 2D only
+    try:
+        from shapely import wkb
+        g["geometry"] = g.geometry.apply(
+            lambda geom: wkb.loads(wkb.dumps(geom, output_dimension=2)) if geom and not geom.is_empty else geom
+        )
+    except Exception:
+        pass
+
+    # promote Polygon → MultiPolygon (FGDB likes consistent types)
+    def _promote(mp):
+        if mp is None or mp.is_empty:
+            return mp
+        if mp.geom_type == "Polygon":
+            return MultiPolygon([mp])
+        return mp
+    g["geometry"] = g.geometry.apply(_promote)
+
+    # 3) make valid
+    try:
+        from shapely.validation import make_valid
+        g["geometry"] = g.geometry.apply(make_valid)
+    except Exception:
+        g["geometry"] = g.buffer(0)
+
+    # 4) drop empties/invalids
+    g = g[g.geometry.notna() & (~g.geometry.is_empty) & (g.geometry.is_valid)]
+
+    # 5) drop non-finite / out-of-range lon/lat
+    bad = ~g.geometry.apply(_coords_ok)
+    if bad.any():
+        logging.warning(f"Dropping {int(bad.sum())} feature(s) with non-finite or out-of-range coordinates before GDB write.")
+        g = g[~bad]
+
+    # 6) optional precision trim to reduce parts & polygon re-org cost
+    try:
+        from shapely import set_precision
+        g["geometry"] = g.geometry.apply(lambda geom: set_precision(geom, grid_size=1e-7))
+    except Exception:
+        pass
+
+    # 7) nudge dtypes for ArcGIS (avoid int64→float64)
+    for col in ("event_id", "num_points"):
+        if col in g.columns:
+            if np.issubdtype(g[col].dtype, np.integer):
+                # If fits in int32, downcast; else let TARGET_ARCGIS_VERSION handle int64
+                if g[col].dropna().empty:
+                    continue
+                vmin, vmax = g[col].min(), g[col].max()
+                if vmin >= -2147483648 and vmax <= 2147483647:
+                    g[col] = g[col].astype("int32")
+
+    # enforce CRS
+    if g.crs is None or str(g.crs) != "EPSG:4326":
+        g = g.to_crs("EPSG:4326")
+
+    return g
 
 def extract_polygons_only(geom):
     if geom is None:
@@ -224,86 +368,74 @@ def spatial_join_iso(gdf, countries, iso_col, label):
         gdf["iso_a3"] = "UNK"
         return gdf
 
-# ---- writer: single hazard -> GDB (layer by decade/ISO optionally) ----
+def _wrap_lonlat_geom(geom):
+    if geom is None or geom.is_empty:
+        return geom
+    def _f(x, y, z=None):
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return (np.nan, np.nan) if z is None else (np.nan, np.nan, z)
+        x2 = ((x + 180.0) % 360.0) - 180.0
+        y2 = max(-90.0, min(90.0, y))
+        return (x2, y2) if z is None else (x2, y2, z)
+    return shp_transform(_f, geom)
+
+def _bounds_bad(bdf):
+    minx, miny, maxx, maxy = bdf[['minx','miny','maxx','maxy']].T.values
+    finite = np.isfinite(minx) & np.isfinite(miny) & np.isfinite(maxx) & np.isfinite(maxy)
+    oob = (minx < -180.001) | (maxx > 180.001) | (miny < -90.001) | (maxy > 90.001)
+    return (~finite) | oob
+
 def write_single_hazard_gdb(
     gdf: gpd.GeoDataFrame,
-    countries_path: str,
-    output_gdb: str,
-    label: str,
-    date_col: str | None = None,
-    extra_name_part: str | None = None,
-    verbose_geometry_logging: bool = False,
-    do_spatial_iso: bool = False,          # toggle
-    do_temporal_bucketing: bool = False,   # toggle
+    output_path: str,
+    layer_name: str,
+    fix_mode: str = "wrap",
+    precision: float = 1e-7,
+    verbose_geometry_logging: bool = False
 ):
-    """
-    Write ONE hazard dataset (already tagged with event_type) into an OpenFileGDB,
-    layering by decade and ISO only if toggles are enabled.
-    """
-    if gdf is None or gdf.empty:
-        logging.info(f"{label}: nothing to write (empty).")
-        return gpd.GeoDataFrame()
+    """Robust writer for FGDB/GPKG with ArcGIS layer options and coordinate fixes."""
+    if gdf.empty:
+        logging.warning("Nothing to write.")
+        return
 
-    # normalize date column
-    gdf = gdf.copy()
-    if date_col and date_col in gdf.columns and "date" not in gdf.columns:
-        gdf = gdf.rename(columns={date_col: "date"})
-    elif "date" not in gdf.columns:
-        gdf["date"] = pd.NaT
+    df = gdf.copy()
+    if df.crs is None or str(df.crs) != WGS84:
+        df = df.to_crs(WGS84)
 
-    # load countries (only needed if do_spatial_iso)
-    countries = None
-    if do_spatial_iso:
-        countries = gpd.read_file(countries_path).to_crs("EPSG:4326")
-        if ISO_COL not in countries.columns:
-            raise ValueError(f"Countries layer missing '{ISO_COL}'")
+    # clean: make_valid + precision
+    df["geometry"] = df["geometry"].apply(make_valid)
+    if precision and precision > 0 and HAVE_PRECISION:
+        df["geometry"] = df["geometry"].apply(lambda g: shp_set_precision(g, precision))
 
-    # spatial ISO tag (optional)
-    if do_spatial_iso:
-        gdf_iso = spatial_join_iso_single(gdf, countries, ISO_COL, label)
+    # wrap/drop bad coords
+    bad = _bounds_bad(df.bounds)
+    if bad.any():
+        if fix_mode == "wrap":
+            idx = df.index[bad]
+            df.loc[idx, "geometry"] = df.loc[idx, "geometry"].apply(_wrap_lonlat_geom)
+            still_bad = _bounds_bad(df.loc[idx].bounds)
+            if still_bad.any():
+                df = df.drop(index=df.loc[idx[still_bad]].index)
+        else:
+            df = df.drop(index=df.index[bad])
+
+    if verbose_geometry_logging:
+        logging.info(f"Write {layer_name}: {len(df)} features after clean.")
+
+    ext = os.path.splitext(output_path)[1].lower()
+    if ext == ".gdb":
+        # FileGDB with recommended options
+        lco = ["TARGET_ARCGIS_VERSION=ARCGIS_PRO_3_2_OR_LATER", "METHOD=SKIP"]
+        if HAVE_PYOGRIO:
+            pyogrio.write_dataframe(df, output_path, driver="FileGDB", layer=layer_name, layer_options=lco)
+        else:
+            df.to_file(output_path, driver="FileGDB", layer=layer_name)
     else:
-        gdf_iso = gdf.copy()
-        if "iso_a3" not in gdf_iso.columns:
-            gdf_iso["iso_a3"] = "UNK"
-
-    # temporal bucketing (optional)
-    if do_temporal_bucketing:
-        gdf_iso["decade"] = gdf_iso["date"].apply(assign_decade)
-    else:
-        if "decade" not in gdf_iso.columns:
-            gdf_iso["decade"] = "unknown"
-
-    # group into layers
-    grouped = {}
-    for _, row in gdf_iso.iterrows():
-        decade = row.get("decade", "unknown")
-        iso = row.get("iso_a3", "UNK")
-        extra = (extra_name_part or "").strip().lower().replace(" ", "_")
-        layer_name = f"{row.get('event_type','event')}_{decade}_{iso}"
-        if extra:
-            layer_name = f"{layer_name}_{extra}"
-        grouped.setdefault(layer_name[:60], []).append(row)
-
-    # clear existing GDB dir
-    if os.path.exists(output_gdb):
-        import shutil
-        shutil.rmtree(output_gdb, ignore_errors=True)
-
-    # write
-    for lname, rows in grouped.items():
-        lgdf = gpd.GeoDataFrame(rows, crs="EPSG:4326").copy()
-        # standardize geometry
-        lgdf["geometry"] = lgdf["geometry"].buffer(0)
-        lgdf["geometry"] = lgdf["geometry"].apply(ensure_multipolygon)
-        if verbose_geometry_logging:
-            logging.info(f"{label}: layer '{lname}' geometry types:\n{lgdf.geometry.geom_type.value_counts()}")
-        # rename date to event_date for GDB friendliness
-        if "date" in lgdf.columns:
-            lgdf = lgdf.rename(columns={"date": "event_date"})
-        lgdf.to_file(output_gdb, driver="OpenFileGDB", layer=lname)
-
-    logging.info(f"{label}: wrote {len(grouped)} layer(s) to {output_gdb}.")
-    return gdf_iso
+        # GPKG with spatial index
+        if HAVE_PYOGRIO:
+            pyogrio.write_dataframe(df, output_path, driver="GPKG", layer=layer_name, layer_options=["SPATIAL_INDEX=YES"])
+        else:
+            df.to_file(output_path, driver="GPKG", layer=layer_name)
 
 # ---- writer: combined -> GDB (storms + quakes + tsunamis) ----
 def combine_disasters_to_gdb(
