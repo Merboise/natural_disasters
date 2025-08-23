@@ -26,6 +26,7 @@ logs/
 output/
 tmp/
 cache/
+archive/
 
 # GIS artifacts
 *.gdb/
