@@ -7,9 +7,10 @@ import geopandas as gpd
 import numpy as np
 from typing import Optional
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
-from shapely.ops import transform as shp_transform
+from shapely.ops import transform as shp_transform, unary_union
 from shapely.validation import explain_validity, make_valid
 from pathlib import Path
+from pyogrio.errors import DataSourceError as _PgDataSourceError
 
 try:
     import pyogrio
@@ -22,7 +23,6 @@ try:
     HAVE_PRECISION = True
 except Exception:
     HAVE_PRECISION = False
-
 
 # ---- constants ----
 NM_TO_KM = 1.852
@@ -126,6 +126,15 @@ def first_positive(row, names):
                 return v
     return np.nan
 
+def _geom_present_mask(obj) -> pd.Series:
+    """
+    Geometry-present mask without calling GeoSeries.notna() to avoid warnings.
+    Treats 'present' as: geometry is not None AND not empty.
+    """
+    s = obj.geometry if isinstance(obj, gpd.GeoDataFrame) else obj
+    return s.apply(lambda g: (g is not None) and (getattr(g, "is_empty", True) is False))
+
+
 def build_circle(lat, lon, radius_nm, points=180) -> Optional[Polygon]:
     """Approximate circle (WGS84 degrees) centered at (lat,lon); radius in nautical miles."""
     if pd.isna(radius_nm) or radius_nm <= 0:
@@ -179,6 +188,103 @@ def _coords_ok(g):
     return (np.all(x >= -180.000001) and np.all(x <= 180.000001)
             and np.all(y >= -90.000001) and np.all(y <= 90.000001))
 
+def _keep_surface_parts(g):
+    """
+    Keep polygonal parts only. Returns Polygon/MultiPolygon or None.
+    """
+    if g is None or getattr(g, "is_empty", True):
+        return None
+    gt = getattr(g, "geom_type", "")
+    if gt in ("Polygon", "MultiPolygon"):
+        return g
+    if gt == "GeometryCollection":
+        parts = [p for p in g.geoms if getattr(p, "geom_type", "") in ("Polygon", "MultiPolygon")]
+        if not parts:
+            return None
+        try:
+            return unary_union(parts)
+        except Exception:
+            # fallback: pairwise unions with buffer(0) rescue
+            u = parts[0]
+            for p in parts[1:]:
+                try:
+                    u = u.union(p)
+                except Exception:
+                    try:
+                        u = u.buffer(0).union(p.buffer(0))
+                    except Exception:
+                        pass
+            return u
+    return None
+
+
+def _safe_clean(g):
+    """
+    Make geometry valid, strip to polygonal surfaces, and robustify with buffer(0).
+    Returns Polygon/MultiPolygon or None.
+    """
+    if g is None or getattr(g, "is_empty", True):
+        return None
+    try:
+        if not g.is_valid:
+            g = make_valid(g)
+        g = _keep_surface_parts(g)
+        if g is None or g.is_empty:
+            return None
+        g = g.buffer(0)
+        if g is None or g.is_empty:
+            return None
+        return _keep_surface_parts(g)
+    except Exception:
+        try:
+            gg = g.buffer(0)
+            return None if (gg is None or gg.is_empty) else _keep_surface_parts(gg)
+        except Exception:
+            return None
+
+
+def _safe_unary_union(geoms):
+    """
+    Clean each geometry (valid + polygonal) then unary_union with robust fallbacks.
+    Returns Polygon/MultiPolygon or None.
+    """
+    cleaned = []
+    for g in geoms:
+        gg = _safe_clean(g)
+        if gg is not None and not gg.is_empty:
+            cleaned.append(gg)
+    if not cleaned:
+        return None
+    try:
+        return unary_union(cleaned)
+    except Exception:
+        u = cleaned[0]
+        for g in cleaned[1:]:
+            try:
+                u = u.union(g)
+            except Exception:
+                try:
+                    u = u.buffer(0).union(g.buffer(0))
+                except Exception:
+                    continue
+        return u
+
+
+def _union_polys(geoms):
+    """
+    Union only the polygonal members of `geoms`, after cleaning.
+    Returns Polygon/MultiPolygon or None.
+    """
+    polys = []
+    for g in geoms:
+        if g is None or getattr(g, "is_empty", True):
+            continue
+        gt = getattr(g, "geom_type", "")
+        if gt in ("Polygon", "MultiPolygon"):
+            polys.append(_safe_clean(g))
+    if not polys:
+        return None
+    return _safe_unary_union(polys)
 
 def _clean_for_fgdb(gdf):
     import numpy as np
@@ -212,7 +318,7 @@ def _clean_for_fgdb(gdf):
         g["geometry"] = g.buffer(0)
 
     # 4) drop empties/invalids
-    g = g[g.geometry.notna() & (~g.geometry.is_empty) & (g.geometry.is_valid)]
+    g = g[_geom_present_mask(g) & (g.geometry.is_valid)].copy()
 
     # 5) drop non-finite / out-of-range lon/lat
     bad = ~g.geometry.apply(_coords_ok)
@@ -389,6 +495,160 @@ def _bounds_bad(bdf):
     oob = (minx < -180.001) | (maxx > 180.001) | (miny < -90.001) | (maxy > 90.001)
     return (~finite) | oob
 
+def _first_nonnull(series, prefer=None):
+    vals = series.dropna()
+    if prefer is not None:
+        for p in prefer:
+            m = (series.index.get_level_values(0) == p) if hasattr(series.index, "get_level_values") else None
+    return vals.iloc[0] if not vals.empty else None
+
+def _union_polys(geoms):
+    polys = []
+    for g in geoms:
+        if g is None or getattr(g, "is_empty", True):
+            continue
+        gt = getattr(g, "geom_type", "")
+        if gt in ("Polygon", "MultiPolygon"):
+            polys.append(_safe_clean(g))
+    if not polys:
+        return None
+    return _safe_unary_union(polys)
+
+# --- add in helpers.py (near other utils) -------------------------------
+def _prepare_fields_for_ogr(df: gpd.GeoDataFrame, prefer: set | None = None):
+    """
+    Return (df2, rename_map) with column names made OGR-safe and
+    case-insensitively unique. Canonical columns in `prefer` keep their names;
+    conflicting "raw" columns get a suffix like `_raw`, then `_raw2`, etc.
+    """
+    import re
+    if prefer is None:
+        prefer = set(CANON_COLS)
+
+    cols = list(df.columns)
+    rename = {}
+    used_lower = set()
+
+    def sanitize(name: str) -> str:
+        # keep geometry untouched
+        if name == "geometry":
+            return name
+        s = str(name).strip()
+        # collapse whitespace & punctuation
+        s = re.sub(r"[^\w]+", "_", s)          # non [0-9A-Za-z_]
+        s = re.sub(r"_+", "_", s).strip("_")   # dedupe underscores
+        if not s:
+            s = "field"
+        if s[0].isdigit():
+            s = "f_" + s
+        # GPKG is fine with long names, but keep reasonable
+        if len(s) > 60:
+            s = s[:60]
+        return s
+
+    # First pass: propose sanitized names
+    proposed = {c: sanitize(c) for c in cols}
+
+    # Second pass: enforce case-insensitive uniqueness with preference
+    for c in cols:
+        if c == "geometry":
+            continue
+        base = proposed[c]
+        key = base.lower()
+
+        # If name already taken in a case-insensitive way:
+        if key in used_lower:
+            # keep canonical column names if they collide
+            if c in prefer:
+                # find a unique variant with numeric suffix
+                i = 2
+                base_i = base
+                while (base_i.lower() in used_lower):
+                    base_i = f"{base}_{i}"
+                    i += 1
+                base = base_i
+            else:
+                # raw column colliding with (likely) canonical; tag as _raw (then _raw2, ...)
+                base_i = f"{base}_raw"
+                i = 2
+                while (base_i.lower() in used_lower):
+                    base_i = f"{base}_raw{i}"
+                    i += 1
+                base = base_i
+
+        used_lower.add(base.lower())
+        rename[c] = base
+
+    df2 = df.rename(columns=rename)
+    # log a tiny hint in case you need to trace names later
+    try:
+        collisions = {k: v for k, v in rename.items() if k != v and k != "geometry"}
+        if collisions:
+            logging.info(f"Field rename(s) for OGR safety: {collisions}")
+    except Exception:
+        pass
+
+    return df2, rename
+
+def _gpkg_remove_layer(path: str, layer_name: str) -> bool:
+    """
+    Delete a layer from a GeoPackage if it exists. Returns True if a layer was removed.
+    """
+    try:
+        import pyogrio
+        from osgeo import ogr
+    except Exception:
+        return False
+
+    try:
+        names = pyogrio.list_layers(path)[0]  # returns (names, geometry_types[, ...])
+    except Exception:
+        names = []
+    if layer_name not in names:
+        return False
+
+    try:
+        ds = ogr.Open(path, update=1)
+        if ds is None:
+            return False
+        # Find layer index by name
+        for i in range(ds.GetLayerCount()):
+            lyr = ds.GetLayerByIndex(i)
+            if lyr is not None and lyr.GetName() == layer_name:
+                ds.DeleteLayer(i)
+                ds = None
+                return True
+        ds = None
+        return False
+    except Exception:
+        return False
+
+def write_gpkg(df: gpd.GeoDataFrame, path: str, layer_name: str, *, overwrite: bool = True, append: bool = False):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    # NEW: sanitize/dedupe fields before writing
+    df, _ = _prepare_fields_for_ogr(df, prefer=set(CANON_COLS))
+
+    if HAVE_PYOGRIO:
+        try:
+            lco = {"SPATIAL_INDEX": "YES"}
+            if overwrite:
+                lco = {"SPATIAL_INDEX": "YES", "OVERWRITE": "YES"}
+            pyogrio.write_dataframe(df, path, driver="GPKG", layer=layer_name,
+                                    layer_options=lco, append=bool(append and not overwrite))
+            return
+        except Exception:
+            # Fallback: remove the layer, then write fresh
+            if overwrite and os.path.exists(path) and _gpkg_remove_layer(path, layer_name):
+                pyogrio.write_dataframe(df, path, driver="GPKG", layer=layer_name,
+                                        layer_options={"SPATIAL_INDEX": "YES"})
+                return
+            raise
+    else:
+        if overwrite and os.path.exists(path):
+            _gpkg_remove_layer(path, layer_name)
+        df.to_file(path, driver="GPKG", layer=layer_name)
+
 def write_single_hazard_gdb(
     gdf: gpd.GeoDataFrame,
     output_path: str,
@@ -397,21 +657,31 @@ def write_single_hazard_gdb(
     precision: float = 1e-7,
     verbose_geometry_logging: bool = False
 ):
-    """Robust writer for FGDB/GPKG with ArcGIS layer options and coordinate fixes."""
-    if gdf.empty:
+    if gdf is None or gdf.empty:
         logging.warning("Nothing to write.")
         return
 
     df = gdf.copy()
+
+    # enforce CRS
     if df.crs is None or str(df.crs) != WGS84:
         df = df.to_crs(WGS84)
 
-    # clean: make_valid + precision
-    df["geometry"] = df["geometry"].apply(make_valid)
-    if precision and precision > 0 and HAVE_PRECISION:
-        df["geometry"] = df["geometry"].apply(lambda g: shp_set_precision(g, precision))
+    # drop empties early
+    df = df[_geom_present_mask(df)].copy()
 
-    # wrap/drop bad coords
+    # clean geometry: make_valid + optional precision snap
+    try:
+        df["geometry"] = df["geometry"].apply(make_valid)
+        if precision and precision > 0 and HAVE_PRECISION:
+            df["geometry"] = df["geometry"].apply(lambda g: shp_set_precision(g, precision))
+    except Exception:
+        df["geometry"] = df.buffer(0)
+
+    # drop empties again if any
+    df = df[_geom_present_mask(df)].copy()
+
+    # wrap or drop out-of-range coords
     bad = _bounds_bad(df.bounds)
     if bad.any():
         if fix_mode == "wrap":
@@ -424,22 +694,44 @@ def write_single_hazard_gdb(
             df = df.drop(index=df.index[bad])
 
     if verbose_geometry_logging:
-        logging.info(f"Write {layer_name}: {len(df)} features after clean.")
+        logging.info(f"{layer_name}: {len(df)} feature(s) after clean.")
 
+    df, _ = _prepare_fields_for_ogr(df, prefer=set(CANON_COLS))
+
+    # choose writer by extension
     ext = os.path.splitext(output_path)[1].lower()
+
     if ext == ".gdb":
-        # FileGDB with recommended options
-        lco = ["TARGET_ARCGIS_VERSION=ARCGIS_PRO_3_2_OR_LATER", "METHOD=SKIP"]
-        if HAVE_PYOGRIO:
-            pyogrio.write_dataframe(df, output_path, driver="FileGDB", layer=layer_name, layer_options=lco)
-        else:
-            df.to_file(output_path, driver="FileGDB", layer=layer_name)
-    else:
-        # GPKG with spatial index
-        if HAVE_PYOGRIO:
-            pyogrio.write_dataframe(df, output_path, driver="GPKG", layer=layer_name, layer_options=["SPATIAL_INDEX=YES"])
-        else:
-            df.to_file(output_path, driver="GPKG", layer=layer_name)
+        # Try FileGDB; fall back to GPKG if unavailable
+        try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            lco = ["TARGET_ARCGIS_VERSION=ARCGIS_PRO_3_2_OR_LATER", "METHOD=SKIP"]
+            if HAVE_PYOGRIO:
+                pyogrio.write_dataframe(df, output_path, driver="FileGDB",
+                                        layer=layer_name, layer_options=lco)
+            else:
+                df.to_file(output_path, driver="FileGDB", layer=layer_name)
+            return
+        except Exception as e:
+            # inside write_single_hazard_gdb(), in the FileGDB exception fallback:
+            fallback = output_path[:-4] + ".gpkg"
+            logging.warning(f"FileGDB write failed ({e}); falling back to GPKG: {fallback}")
+            try:
+                write_gpkg(df, fallback, layer_name, overwrite=True)   # <— ensure overwrite
+                logging.info(f"Wrote fallback GPKG: {fallback}")
+                return
+            except Exception as e2:
+                logging.error(f"GPKG fallback also failed: {e2}")
+                raise
+
+
+    # Non-.gdb → write GPKG directly
+    try:
+        write_gpkg(df, output_path, layer_name)
+    except Exception as e:
+        logging.error(f"GPKG write failed for {output_path}: {e}")
+        raise
+
 
 # --- unifed additions
 def _ensure_cols(gdf, cols):
@@ -450,7 +742,9 @@ def _ensure_cols(gdf, cols):
 
 def _area_km2(geom):
     try:
-        return gpd.GeoSeries([geom], crs="EPSG:4326").to_crs("EPSG:3857").area.iloc[0] / 1e6
+        if geom is None or getattr(geom, "is_empty", True) or not getattr(geom, "is_valid", True):
+            return None
+        return gpd.GeoSeries([geom], crs="EPSG:4326").to_crs("EPSG:6933").area.iloc[0] / 1e6
     except Exception:
         return None
 
@@ -496,18 +790,111 @@ def unify_schema_tsunamis(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     out = _ensure_cols(out, CANON_COLS)
     return out[CANON_COLS]
 
+# helpers.py
+# helpers.py
+def unify_schema_floods(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Non-destructive canonicalizer for floods:
+    - Preserves ALL existing columns (incl. enriched fields).
+    - Only fills canonical fields if missing.
+    - Computes area_km2 ONLY where it's NaN.
+    """
+    if gdf is None or gdf.empty:
+        return gdf if isinstance(gdf, gpd.GeoDataFrame) else gpd.GeoDataFrame(columns=CANON_COLS, geometry=[])
+
+    out = gdf.copy()
+
+    # event_type
+    if "event_type" not in out.columns or out["event_type"].isna().all():
+        out["event_type"] = "flood"
+
+    # start/end time: never drop original *_date columns; just ensure canonical *_time exist
+    st = pd.to_datetime(out.get("start_time"), errors="coerce")
+    if "start_time" not in out.columns or st.isna().all():
+        st2 = pd.to_datetime(out.get("start_date"), errors="coerce")
+        out["start_time"] = st.fillna(st2)
+
+    en = pd.to_datetime(out.get("end_time"), errors="coerce")
+    if "end_time" not in out.columns or en.isna().all():
+        en2 = pd.to_datetime(out.get("end_date"), errors="coerce")
+        out["end_time"] = en.fillna(en2)
+
+    # fill end_time with start_time when missing
+    m = out["end_time"].isna() & out["start_time"].notna()
+    if m.any():
+        out.loc[m, "end_time"] = out.loc[m, "start_time"]
+
+    # geom_method: only set from footprint_method if geom_method missing/empty
+    if ("geom_method" not in out.columns) or out["geom_method"].isna().all():
+        if "footprint_method" in out.columns:
+            out["geom_method"] = out.get("geom_method", None)
+            fill_idx = out["geom_method"].isna()
+            if fill_idx.any():
+                out.loc[fill_idx, "geom_method"] = out.loc[fill_idx, "footprint_method"]
+
+    # defaults that don't overwrite
+    if "band" not in out.columns:
+        out["band"] = None
+    if "geom_confidence" not in out.columns:
+        out["geom_confidence"] = None
+
+    # area_km2: compute equal-area only where NaN
+    out["area_km2"] = pd.to_numeric(out.get("area_km2"), errors="coerce")
+    try:
+        need = out["area_km2"].isna()
+        if need.any():
+            areas = gpd.GeoSeries(out.geometry, crs="EPSG:4326").to_crs("EPSG:6933").area / 1e6
+            out.loc[need, "area_km2"] = areas[need]
+    except Exception:
+        # leave as-is on failure; we don't overwrite existing values
+        pass
+
+    # ensure canonical columns exist
+    for c in CANON_COLS:
+        if c not in out.columns:
+            out[c] = None
+
+    # reorder: canonical first, then every other column (preserved)
+    extras = [c for c in out.columns if c not in CANON_COLS]
+    return out[CANON_COLS + extras]
+
 def haversine_km(lat1, lon1, lat2, lon2):
+    """
+    Vectorized great-circle distance in km.
+    Works for any mix of scalars/vectors by broadcasting all inputs
+    to a common shape before masking.
+    """
     R = 6371.0
-    p1 = np.radians(lat1); p2 = np.radians(lat2)
+    A1, B1, A2, B2 = np.broadcast_arrays(
+        np.asarray(lat1, dtype=float),
+        np.asarray(lon1, dtype=float),
+        np.asarray(lat2, dtype=float),
+        np.asarray(lon2, dtype=float),
+    )
+    out = np.full(A1.shape, np.nan, dtype=float)
+
+    m = np.isfinite(A1) & np.isfinite(B1) & np.isfinite(A2) & np.isfinite(B2)
+    if not np.any(m):
+        return out
+
+    p1 = np.radians(A1[m]); p2 = np.radians(A2[m])
     dlat = p2 - p1
-    dlon = np.radians(lon2 - lon1)
-    a = np.sin(dlat/2.0)**2 + np.cos(p1)*np.cos(p2)*np.sin(dlon/2.0)**2
-    return 2*R*np.arcsin(np.sqrt(a))
+    dlon = np.radians(B2[m] - B1[m])
+
+    with np.errstate(invalid="ignore"):
+        a = np.sin(dlat/2.0)**2 + np.cos(p1)*np.cos(p2)*np.sin(dlon/2.0)**2
+        out[m] = 2 * R * np.arcsin(np.sqrt(a))
+    return out
 
 def _centroid_latlon(gdf: gpd.GeoDataFrame):
-    if gdf.empty: return (np.array([]), np.array([]))
-    c = gdf.geometry.centroid.to_crs("EPSG:4326")
-    return np.array(c.y), np.array(c.x)
+    if gdf.empty:
+        return (np.array([]), np.array([]))
+    g = gdf
+    if g.crs is None or str(g.crs) != "EPSG:4326":
+        g = g.to_crs("EPSG:4326")
+    pts = g.geometry.representative_point()   # safer than centroid
+    pts = gpd.GeoSeries(pts, crs=g.crs).to_crs("EPSG:4326")
+    return np.asarray(pts.y), np.asarray(pts.x)
 
 def spatial_temporal_filter(
     gdf: gpd.GeoDataFrame,
@@ -630,6 +1017,7 @@ def write_exclusions(
     storms_before: gpd.GeoDataFrame, storms_after: gpd.GeoDataFrame,
     quakes_before: gpd.GeoDataFrame,  quakes_after: gpd.GeoDataFrame,
     tsu_before: gpd.GeoDataFrame,     tsu_after: gpd.GeoDataFrame,
+    floods_before: gpd.GeoDataFrame, floods_after: gpd.GeoDataFrame,
 ):
     """Write: (1) unmatched/matched EM-DAT CSVs, (2) excluded features per hazard to a GPKG."""
     os.makedirs(output_folder, exist_ok=True)
@@ -655,6 +1043,9 @@ def write_exclusions(
         if tsu_before is not None and hasattr(tsu_before, "empty") and not tsu_before.empty:
             excl = tsu_before.loc[tsu_before.index.difference(tsu_after.index if not tsu_after.empty else [])]
             if not excl.empty: excl.to_file(gpkg, layer="tsunamis_excluded", driver="GPKG")
+        if not floods_before.empty:
+            excl = floods_before.loc[floods_before.index.difference(floods_after.index if not floods_after.empty else [])]
+            if not excl.empty: excl.to_file(gpkg, layer="floods_excluded", driver="GPKG")
     except Exception as e:
         logging.warning(f"Failed writing excluded features GPKG: {e}")
 
@@ -761,6 +1152,7 @@ def combine_disasters_to_gdb(
     for lname, lgdf in layers.items():
         try:
             lgdf = lgdf.copy()
+            lgdf = lgdf[_geom_present_mask(lgdf)].copy()
             lgdf['geometry'] = lgdf['geometry'].buffer(0)
             lgdf['geometry'] = lgdf['geometry'].apply(ensure_multipolygon)
 

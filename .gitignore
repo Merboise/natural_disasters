@@ -18,6 +18,7 @@ onetime/
 .vscode/
 .idea/
 .DS_Store
+ne_10m/ne_10m*
 
 # Data/output you likely don't want in git
 data/
