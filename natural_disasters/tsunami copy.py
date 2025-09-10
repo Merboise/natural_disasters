@@ -21,6 +21,10 @@ os.environ.setdefault("OGR_NUM_THREADS",  "ALL_CPUS")
 # Global GDAL cache ~32 GB (MB units; no commas)
 os.environ.setdefault("GDAL_CACHEMAX", "32768")
 
+# ✅ Ensure GDAL/PROJ are properly bootstrapped (your earlier request)
+from .bootstrap_gdal import verify_gdal_ready
+verify_gdal_ready()
+
 import logging, math, tempfile, time, warnings
 import numpy as np
 import pandas as pd
@@ -1049,10 +1053,10 @@ def _tile_union_worker(args):
     """
     Top-level function (picklable) to run a single DEM tile streaming and return a WGS84 polygon.
     """
+    from shapely import from_wkb
     (dem_path, roi_wkb, coast_touch_wkb, Hmax,
      simplify_m_stream, polygon_min_area_m2,
      min_preview_hits, min_valid_pixels, gdal_cache_mb) = args
-    from shapely import from_wkb
     roi_wgs = from_wkb(roi_wkb)
     coast_touch_wgs = from_wkb(coast_touch_wkb) if coast_touch_wkb is not None else None
 
@@ -1773,80 +1777,4 @@ def process_tsunami_data(
         logging.info(f"Processing event {int(event_id)} with {len(grp_gdf)} runups (event-centric)")
 
         inund = build_tsunami_inundation(
-            runups_gdf=grp_gdf[['latitude','longitude','runupHt','tsunamiEventId','geometry']],
-            coast_gdf=countries,
-            event_id=event_id,
-            inland_limit_km=inland_limit_km,
-            band_percents=band_percents,
-            use_dem=use_dem,
-            dem_local_root=dem_local_root,
-            dem_tile_size_deg=dem_tile_size_deg,
-            tmp_dir=tmp_dir,
-            stream_to_disk=stream_to_disk,
-            polygon_min_area_m2=polygon_min_area_m2,
-            min_preview_hits=min_preview_hits,
-            min_valid_pixels=min_valid_pixels,
-            simplify_m_stream=simplify_m_stream
-        )
-        if inund.empty:
-            continue
-
-        ev = events_df[events_df['id'] == event_id]
-        inund['iso_a3'] = None
-        inund['event_type'] = 'tsunami'
-        inund['date'] = ev.iloc[0]['date'] if not ev.empty else pd.NaT
-
-        if write_per_event:
-            if per_event_format == "gpkg":
-                out_path = os.path.join(per_event_dir, f"tsunami_{int(event_id)}.gpkg")
-                driver = "GPKG"; layer = per_event_layer
-            else:
-                gdb_name = f"tsunami_{int(event_id)}.gdb"
-                out_path = os.path.join(per_event_dir, gdb_name)
-                driver = "FileGDB"; layer = per_event_layer
-                try:
-                    if "FileGDB" not in getattr(fiona, "supported_drivers", {}):
-                        logging.warning("FileGDB writer unavailable; writing GPKG instead.")
-                        out_path = os.path.join(per_event_dir, f"tsunami_{int(event_id)}.gpkg")
-                        driver = "GPKG"; layer = per_event_layer
-                except Exception:
-                    logging.warning("Could not verify Fiona drivers; using GPKG for safety.")
-                    out_path = os.path.join(per_event_dir, f"tsunami_{int(event_id)}.gpkg")
-                    driver = "GPKG"; layer = per_event_layer
-            try:
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                _write_vector(inund, out_path, driver=driver, layer=per_event_layer)
-                logging.info(f"Wrote per-event tsunami: {out_path} (layer={per_event_layer}, driver={driver})")
-            except Exception as e:
-                logging.error(f"Failed writing per-event output for event {event_id}: {e}")
-
-        results.append(inund)
-
-    if not results:
-        logging.warning("No tsunami inundation polygons produced.")
-        return gpd.GeoDataFrame()
-
-    out = gpd.GeoDataFrame(pd.concat(results, ignore_index=True), crs=WGS84)
-    out = _activate_geometry_column(out, crs=WGS84)
-    logging.info(f"Produced {len(out):,} tsunami polygons (combined).")
-
-    if write_aggregate and aggregate_path:
-        try:
-            driver = "GPKG"
-            if not aggregate_path.lower().endswith(".gpkg"):
-                try:
-                    if "FileGDB" in getattr(fiona, "supported_drivers", {}):
-                        driver = "FileGDB"
-                    else:
-                        logging.warning("FileGDB writer not available; switching aggregate to GPKG.")
-                        aggregate_path = (os.path.splitext(aggregate_path)[0] + ".gpkg")
-                except Exception:
-                    logging.warning("Could not check Fiona drivers; switching aggregate to GPKG.")
-                    aggregate_path = (os.path.splitext(aggregate_path)[0] + ".gpkg")
-            layer = "tsunamis_all"
-            _write_vector(out, aggregate_path, driver=driver, layer=layer)
-            logging.info(f"Wrote aggregate tsunamis: {aggregate_path} (layer={layer}, driver={driver})")
-        except Exception as e:
-            logging.error(f"Failed writing aggregate tsunamis: {e}")
-
-    return out
+            runups_gdf=grp_gdf[['latitude','longitude','runupHt','tsunamiEventId',]()]()

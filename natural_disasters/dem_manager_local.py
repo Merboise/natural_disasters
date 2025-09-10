@@ -1,4 +1,4 @@
-# dem_manager_local.py  (only the bits you need to replace/add)
+# dem_manager_local.py
 from __future__ import annotations
 import os, re, logging
 from pathlib import Path
@@ -6,7 +6,7 @@ from typing import Iterable, Tuple, Optional, List, Union
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import box
-import shapely
+from shapely.ops import unary_union
 
 WGS84 = "EPSG:4326"
 MERIT_TILE_DEG = 5
@@ -51,7 +51,6 @@ def _scan_paths(
         if not root.exists():
             log.warning("DEM root does not exist: %s", root)
             continue
-        # Fast scandir-style recursion
         for p in root.rglob("*"):
             if not p.is_file():
                 continue
@@ -63,7 +62,7 @@ def _scan_paths(
     log.info("Found %d DEM tiles under %s", len(paths), roots)
     return paths
 
-def _bbox_from_sw(sw_lat: int, sw_lon: int, tile_deg: int) -> "shapely.geometry.Polygon":
+def _bbox_from_sw(sw_lat: int, sw_lon: int, tile_deg: int):
     return box(sw_lon, sw_lat, sw_lon + tile_deg, sw_lat + tile_deg)
 
 def build_local_dem_index(
@@ -76,16 +75,10 @@ def build_local_dem_index(
     """
     AUTOPATHING INDEX BUILDER FOR HUGE MERIT TREES
 
-    - roots:      "C:\\...\\Elevation" OR an iterable of specific subfolders.
-    - tile_size_deg: 5 for MERIT (default).
-    - suffix:     tuple of filename suffixes to include (e.g., ('_elv_tiled.tif','_elv.tif','.tif')).
-    - cache_path: optional .gpkg/.parquet/.feather to avoid rescanning every run.
-    - force_rebuild: force a rescan even if cache exists.
-
     Returns GeoDataFrame with columns:
       path, tile_id, sw_lat, sw_lon, ne_lat, ne_lon, center_lat, center_lon, geometry (WGS84)
     """
-    # 1) Load from cache if available
+    # 1) Load cache if present
     if cache_path and (not force_rebuild) and Path(cache_path).exists():
         cp = str(cache_path)
         ext = Path(cp).suffix.lower()
@@ -99,7 +92,7 @@ def build_local_dem_index(
             gdf = gpd.read_feather(cp)
             gdf = gpd.GeoDataFrame(gdf, geometry="geometry", crs=WGS84)
         else:
-            gdf = gpd.read_file(cp)  # best-effort
+            gdf = gpd.read_file(cp)
         if gdf.crs is None or str(gdf.crs) != WGS84:
             gdf = gdf.set_crs(WGS84, allow_override=True)
         return gdf
@@ -133,7 +126,7 @@ def build_local_dem_index(
 
     gdf = gpd.GeoDataFrame(pd.DataFrame.from_records(recs), geometry="geometry", crs=WGS84)
 
-    # 3) Save cache if requested
+    # 3) Cache if requested
     if cache_path:
         cp = str(cache_path)
         ext = Path(cp).suffix.lower()
@@ -145,7 +138,6 @@ def build_local_dem_index(
             elif ext in (".feather", ".ft"):
                 gdf.to_feather(cp)
             else:
-                # default to gpkg if user passed unknown extension
                 cp2 = str(Path(cp).with_suffix(".gpkg"))
                 gdf.to_file(cp2, layer="dem_index", driver="GPKG")
                 log.info("Saved DEM index to %s (auto .gpkg)", cp2)
@@ -153,3 +145,18 @@ def build_local_dem_index(
             log.warning("Failed to write DEM index cache (%s): %s", cp, e)
 
     return gdf
+
+# --- NEW: quick selector for tiles intersecting a (tiny) gate polygon
+def select_tiles_for_gate(index_gdf: gpd.GeoDataFrame, gate_wgs84) -> gpd.GeoDataFrame:
+    """
+    Return subset of MERIT tiles that intersect the given WGS84 gate polygon.
+    Assumes index_gdf.crs == EPSG:4326.
+    """
+    if index_gdf is None or index_gdf.empty:
+        return index_gdf.iloc[[]]
+    try:
+        idx = list(index_gdf.sindex.query(gate_wgs84, predicate="intersects"))
+        out = index_gdf.iloc[idx] if idx else index_gdf.iloc[[]]
+    except Exception:
+        out = index_gdf[index_gdf.intersects(gate_wgs84)]
+    return out.reset_index(drop=True)

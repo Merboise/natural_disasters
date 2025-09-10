@@ -1,16 +1,18 @@
 # ----
 # helpers.py (constants, logging, geometry helpers, optional ISO/time joins, GDB writers)
 # ----
-import os, sys, logging, psutil, math
+import os, sys, logging, psutil, math, re
 import pandas as pd
 import geopandas as gpd
 import numpy as np
 from typing import Optional
-from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
-from shapely.ops import transform as shp_transform, unary_union
+from shapely.geometry import Point, Polygon, MultiPolygon, GeometryCollection, box
+from shapely.ops import transform as shp_transform, unary_union, split as shp_split
+from shapely.ops import snap as shp_snap
 from shapely.validation import explain_validity, make_valid
 from pathlib import Path
 from pyogrio.errors import DataSourceError as _PgDataSourceError
+from pyproj import CRS, Transformer
 
 try:
     import pyogrio

@@ -1,55 +1,84 @@
-# natural_disasters/bootstrap_gdal.py
-import os
+# bootstrap_gdal.py
+from __future__ import annotations
+import os, sys, logging
 from pathlib import Path
 
-OSGEO = r"C:\OSGeo4W"
+logger = logging.getLogger(__name__)
+OSGEO = os.environ.get("OSGEO4W_ROOT", r"C:\OSGeo4W")
 
-# set env *before any* GDAL/pyogrio import
-os.environ["GDAL_DATA"] = rf"{OSGEO}\apps\gdal\share\gdal"
-os.environ["PROJ_LIB"]  = rf"{OSGEO}\share\proj"
+from contextlib import contextmanager
 
-# help Windows locate GDAL/PROJ DLLs
-try:
-    os.add_dll_directory(rf"{OSGEO}\bin")
-except Exception:
-    pass
+def _ensure_osgeo_importable() -> None:
+    # Only add the minimal import path for GDAL Python bindings; append (don’t front-load)
+    gdal_py = rf"{OSGEO}\apps\gdal\python"
+    if Path(gdal_py).is_dir() and gdal_py not in sys.path:
+        sys.path.append(gdal_py)
+
+@contextmanager
+def _osgeo_dll_dir():
+    """Temporarily add OSGeo4W\\bin to the DLL search path for GDAL import."""
+    handle = None
+    bin_dir = rf"{OSGEO}\bin"
+    try:
+        if Path(bin_dir).is_dir() and hasattr(os, "add_dll_directory"):
+            handle = os.add_dll_directory(bin_dir)
+        yield
+    finally:
+        if handle is not None:
+            try:
+                handle.close()  # remove the DLL dir from the search path
+            except Exception:
+                pass
+
+
+def _first_existing(*cands: str) -> str | None:
+    for p in cands:
+        if p and Path(p).is_dir():
+            return p
+    return None
+
+def _diag_banner(tag: str) -> None:
+    logger.info("[GDAL DIAG] %s", tag)
+    logger.info("[GDAL DIAG] exe=%s", sys.executable)
+    pyd = Path(OSGEO) / r"apps\Python312\Lib\site-packages\osgeo\_gdal.cp312-win_amd64.pyd"
+    logger.info("[GDAL DIAG] _gdal.pyd exists? %s", pyd.exists())
 
 def verify_gdal_ready():
-    """
-    Verify GDAL/PROJ using public APIs only.
-    - Confirms the env paths exist
-    - Registers GDAL
-    - Imports EPSG:4326 via GDAL
-    - Builds a 4326->3857 transformer via PROJ (pyproj)
-    Returns the resolved (GDAL_DATA, PROJ_LIB).
-    """
-    gd = os.environ.get("GDAL_DATA", "")
-    pj = os.environ.get("PROJ_LIB", "")
+    gdal_candidates = [rf"{OSGEO}\apps\gdal\share\gdal", rf"{OSGEO}\share\gdal"]
+    proj_candidates = [rf"{OSGEO}\share\proj", rf"{OSGEO}\projlib"]
 
-    if not Path(gd).is_dir():
-        raise RuntimeError(f"GDAL_DATA invalid or missing: {gd}")
-    if not Path(pj).is_dir():
-        raise RuntimeError(f"PROJ_LIB invalid or missing: {pj}")
+    gd_env = os.environ.get("GDAL_DATA")
+    pj_env = os.environ.get("PROJ_LIB")
 
-    # Now touch GDAL/PROJ
-    from osgeo import gdal, osr
+    gd = gd_env if (gd_env and Path(gd_env).is_dir()) else _first_existing(*gdal_candidates)
+    pj = pj_env if (pj_env and Path(pj_env).is_dir()) else _first_existing(*proj_candidates)
+
+    if not gd or not Path(gd).is_dir():
+        raise RuntimeError(f"GDAL_DATA invalid or missing: {gd!r}")
+    if not pj or not Path(pj).is_dir():
+        raise RuntimeError(f"PROJ_LIB invalid or missing: {pj!r}")
+
+    os.environ["GDAL_DATA"] = gd
+    os.environ["PROJ_LIB"]  = pj
+
+    # Import only now (no find_spec on submodules!)
+    try:
+        from osgeo import gdal, osr  # noqa: F401
+    except Exception:
+        _ensure_osgeo_importable()
+        with _osgeo_dll_dir():
+            _diag_banner("import with transient OSGeo DLL dir")
+            from osgeo import gdal, osr  # noqa: F401
+
     import pyproj
-
-    # Make sure GDAL sees the config
-    if gd: gdal.SetConfigOption("GDAL_DATA", gd)
-    if pj: gdal.SetConfigOption("PROJ_LIB", pj)
+    gdal.SetConfigOption("GDAL_DATA", gd)
+    gdal.SetConfigOption("PROJ_LIB", pj)
     gdal.AllRegister()
 
-    # Check EPSG load via GDAL (SRS database uses GDAL_DATA)
     srs = osr.SpatialReference()
     if srs.ImportFromEPSG(4326) != 0:
         raise RuntimeError("GDAL failed to load EPSG definitions (check GDAL_DATA).")
 
-    # Check a simple transform via PROJ (uses pyproj data / PROJ_LIB)
-    try:
-        tr = pyproj.Transformer.from_crs(4326, 3857, always_xy=True)
-        _x, _y = tr.transform(-122.4, 37.8)  # should succeed
-    except Exception as e:
-        raise RuntimeError(f"PROJ failed to create transformer (check PROJ_LIB): {e}")
-
+    # PROJ smoke test
+    pyproj.Transformer.from_crs(4326, 3857, always_xy=True).transform(-122.4, 37.8)
     return gd, pj
