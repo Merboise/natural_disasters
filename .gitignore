@@ -12,6 +12,9 @@ dist/
 venv/
 .env
 onetime/
+codex_output.py
+infill_config.py
+tsunami_disk_cache.py
 
 # Notebooks / editors
 .ipynb_checkpoints/

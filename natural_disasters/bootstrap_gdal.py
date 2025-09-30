@@ -75,6 +75,11 @@ def verify_gdal_ready():
     gdal.SetConfigOption("PROJ_LIB", pj)
     gdal.AllRegister()
 
+    # Be explicit about OSR exception behavior to silence GDAL 4.0 warning
+    try:
+        osr.UseExceptions()
+    except Exception:
+        pass
     srs = osr.SpatialReference()
     if srs.ImportFromEPSG(4326) != 0:
         raise RuntimeError("GDAL failed to load EPSG definitions (check GDAL_DATA).")

@@ -24,7 +24,7 @@ import calendar
 
 from .storms import process_ibtracs_data
 from .quakes import process_earthquake_data
-from .tsunamis import process_tsunami_data
+from ..archive.tsunamis import process_tsunami_data
 from .floods import process_flood_data, enrich_floods
 
 load_dotenv()
