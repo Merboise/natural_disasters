@@ -10,7 +10,11 @@ from .infill_config import InfillConfig
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import Point, LineString, Polygon
+import os
+import networkx as nx
+import threading
+from collections import Counter
+from shapely.geometry import Point, LineString, Polygon, box
 from shapely.ops import unary_union, substring, linemerge
 from shapely import STRtree
 
@@ -37,7 +41,21 @@ WEBM = 3857
 
 logger = logging.getLogger("tsunami.runups")
 
+def _trace_enabled():
+    return logger.isEnabledFor(logging.DEBUG) or os.environ.get("ND_TRACE", "0") == "1"
+
 @contextmanager
+def _trace(tag: str, **fields):
+    if _trace_enabled():
+        logger.info(">> %s %s", tag, fields if fields else "")
+        t0 = time.time()
+        try:
+            yield
+        finally:
+            logger.info("<< %s dt=%.2fs", tag, time.time() - t0)
+    else:
+        yield
+
 def _timer(tag: str):
     # shim to keep local signature; delegate to helpers
     with _h_timer(tag):
@@ -351,6 +369,8 @@ def route_along_coast_astar(cg: CoastGraph,
     max_f = float(delta_max_m) + 1e-6
 
     visited = set()
+    _visits = 0
+    _t_start = time.time()
     while openpq:
         f, u = heapq.heappop(openpq)
         if u in visited:
@@ -364,6 +384,9 @@ def route_along_coast_astar(cg: CoastGraph,
             return None
 
         gu = g[u]
+        _visits += 1
+        if _trace_enabled and (_visits % 5000 == 0):
+            logger.debug("astar step visits=%d open=%d best_f=%.0f g=%.0f", _visits, len(openpq), f, gu)
         for v, via_eid, via_tmp in _neighbors(u):
             # compute step cost
             if via_eid is not None:
@@ -456,6 +479,15 @@ def route_along_coast_astar(cg: CoastGraph,
     if merged.geom_type == "MultiLineString":
         # pick the longest component
         merged = max(merged.geoms, key=lambda g: g.length)
+
+    if log_timing:
+        try:
+            logger.info(
+                "astar: visits=%d explored=%d chain=%d length_km=%.3f",
+                _visits, len(visited), len(chain), float(merged.length)/1000.0
+            )
+        except Exception:
+            pass
 
     return merged
 # ---------- normalize ----------
@@ -706,6 +738,9 @@ def build_runup_segments(
     with _timer("segments:to_metric_parts"):
         parts_meters = [gpd.GeoSeries([g], crs=WGS84).to_crs(WEBM).iloc[0] for g in parts_wgs]
 
+    j_by_pid = {int(pid): j for j, pid in enumerate(parent_ids)}
+    pid_by_j = {j: int(pid) for j, pid in enumerate(parent_ids)}
+
     candidates = snapped_points.loc[snapped_points[height_col] >= float(height_meters_min)]
     if candidates.empty:
         return gpd.GeoDataFrame(columns=["parent_feature_id", "geometry"], geometry="geometry", crs=WGS84)
@@ -716,28 +751,30 @@ def build_runup_segments(
     with _timer("segments:per_parent_build"):
         for parent_feature_id, df_parent in candidates.groupby("parent_feature_id", sort=False):
             try:
-                line_meters = parts_meters[int(parent_feature_id)]
+                j = j_by_pid.get(int(parent_feature_id))
+                if j is None:
+                    continue
+                line_meters = parts_meters[int(j)]
             except Exception:
                 continue
 
             intervals_meters: list[tuple[float, float]] = []
             for _, row in df_parent.iterrows():
-                station_meters = float(row["station_m"])
+                station_meters = float(row.get("station_m", float("nan")))
+                if not np.isfinite(station_meters):
+                    continue
                 length_km = _height_to_length_km(
-                    row[height_col], 
+                    row[height_col],
                     alongshore_km_min=alongshore_km_min,
                     alongshore_km_max=alongshore_km_max,
-                    km_per_meter_factor=km_per_meter_factor, 
-                    height_exponent=height_exponent
-                    )
-                # Apply user-configurable multiplier to alongshore segment length
-                half = (length_km * float(length_multiplier)) * 500.0  
+                    km_per_meter_factor=km_per_meter_factor,
+                    height_exponent=height_exponent,
+                )
+                half = (length_km * float(length_multiplier)) * 500.0
                 intervals_meters.append((station_meters - half, station_meters + half))
-            
-            intervals_meters = _merge_intervals(intervals_meters, gap_merge_m=merge_tol_meters)
-            segs = _cut_parent_substrings(line_meters, intervals_meters)
-            segments_WEBM.extend(segs)
-            parents.extend([parent_feature_id]*len(segs))
+                segs = _cut_parent_substrings(line_meters, intervals_meters)
+                segments_WEBM.extend(segs)
+                parents.extend([parent_feature_id]*len(segs))
 
     if not segments_WEBM:
         return gpd.GeoDataFrame(geometry=[], crs=WGS84)
@@ -748,7 +785,6 @@ def build_runup_segments(
     out = gpd.GeoDataFrame({"parent_feature_id": parents, "geometry": segments_wgs84}, geometry="geometry", crs=WGS84)
     return out
 
-# ---------- infill ----------
 def infill_runup_segments(
     snapped_gdf: gpd.GeoDataFrame,
     base_segs_gdf: gpd.GeoDataFrame,
@@ -759,26 +795,23 @@ def infill_runup_segments(
     eps_km: float = 15.0,
     min_samples: int = 2,
     majority_threshold: float = 0.5,
-    same_parent_only: bool = True,
-    max_bridge_gap_km: float = 20.0,
+    same_parent_only: bool = False,
+    max_bridge_gap_km: float = 500.0,
     min_combined_coverage: float = 0.6,
     opts: Optional[InfillConfig] = None,
 ) -> gpd.GeoDataFrame:
-    """Fill gaps using lower-height evidence. Returns extra segments to union with base."""
-    import time, threading
-    import numpy as np
-    from shapely.geometry import Point
-    from shapely.strtree import STRtree
-
+    """Fill gaps using lower-height evidence. Returns extra segments to union with base.
+    This version fixes parent_feature_id vs j index confusion and undefined variables.
+    """
     logger.info(
         ">>> entered infill_runup_segments: snapped=%d segments=%d eps_km=%.2f min_samples=%d majority=%.2f same_parent=%s bridge_km=%.1f min_cov=%.2f",
         0 if snapped_gdf is None else len(snapped_gdf),
         0 if base_segs_gdf is None else len(base_segs_gdf),
         eps_km, min_samples, majority_threshold, same_parent_only,
-        max_bridge_gap_km, min_combined_coverage
+        max_bridge_gap_km, min_combined_coverage,
     )
 
-    # Optional tuning via InfillConfig (CLI-controlled). Defaults preserve behavior.
+    # Options
     _allow_zero_cover_bridge = bool(getattr(opts, 'bridge_allow_zero_cover', False))
     _bridge_one_side = bool(getattr(opts, 'bridge_one_side', False))
     _accept_singleton = bool(getattr(opts, 'accept_singleton', False))
@@ -788,11 +821,12 @@ def infill_runup_segments(
 
     logger.debug(
         "infill params effective: eps_km=%.2f min_samples=%d majority=%.2f bridge_max_km=%.1f min_cov=%.2f allow_zero_cover_bridge=%s one_side=%s accept_singleton=%s log_rejects_limit=%d seed_without_base=%s seed_min_km=%.2f",
-        eps_km, min_samples, majority_threshold, max_bridge_gap_km, min_combined_coverage, _allow_zero_cover_bridge,
-        _bridge_one_side, _accept_singleton, _reject_log_limit, _seed_without_base, (_seed_min_m/1000.0),
+        eps_km, min_samples, majority_threshold, max_bridge_gap_km, min_combined_coverage,
+        _allow_zero_cover_bridge, _bridge_one_side, _accept_singleton,
+        _reject_log_limit, _seed_without_base, (_seed_min_m/1000.0),
     )
 
-    # 30s heartbeat
+    # Heartbeat
     _start_ts = time.time()
     _stop_evt = threading.Event()
     def _hb():
@@ -802,230 +836,186 @@ def infill_runup_segments(
     _hb_thread.start()
 
     try:
-        snapped = ensure_wgs84(snapped_gdf)
-        base = ensure_wgs84(base_segs_gdf)
-        coast_lines = ensure_wgs84(coast_lines_gs)
+        snapped = ensure_wgs84(snapped_gdf) if snapped_gdf is not None else gpd.GeoDataFrame(geometry=[], crs=WGS84)
+        base = ensure_wgs84(base_segs_gdf) if base_segs_gdf is not None else gpd.GeoDataFrame(geometry=[], crs=WGS84)
+        coast_lines = ensure_wgs84(coast_lines_gs) if coast_lines_gs is not None else gpd.GeoSeries([], crs=WGS84)
 
-        eps_m = eps_km * 1000.0
-        bridge_m = max_bridge_gap_km * 1000.0
+        eps_m = float(eps_km) * 1000.0
+        bridge_m = float(max_bridge_gap_km) * 1000.0
 
+        # Coast parts and mappings
         parts_meters, parent_ids = _coast_parts_3857(coast_lines)
         parts_list = list(parts_meters)
-        tree = STRtree(parts_list)
-        idx_by_geom = {id(g): i for i, g in enumerate(parts_list)}
-        idx_by_wkb = {g.wkb: i for i, g in enumerate(parts_list)}  # fallback for identity mismatch
+        if not parts_list:
+            return gpd.GeoDataFrame(geometry=[], crs=WGS84)
+        try:
+            _p, _pid, tree, _k = _MC.get_parts_3857_and_tree(gpd.GeoDataFrame(geometry=gpd.GeoSeries(coast_lines), crs=WGS84))
+        except Exception:
+            tree = STRtree(parts_list)
+        idx_by_geom = {id(g): j for j, g in enumerate(parts_list)}  # geom id -> j
+        j_by_pid = {int(pid): j for j, pid in enumerate(parent_ids)}  # pid -> j
+        pid_by_j = {j: int(pid) for j, pid in enumerate(parent_ids)}   # j -> pid
+        len_by_j = np.asarray([float(g.length) for g in parts_list], dtype=float)
 
-        # Base intervals per parent for coverage tests
-        t0 = time.time()
-        base_intervals: dict[int, list[tuple[float, float]]] = {pid: [] for pid in set(parent_ids)}
+        # Base intervals keyed by j
+        base_intervals_j: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
         if not base.empty:
             base_m = to_metric(base)
             for _, row in base_m.iterrows():
-                # Prefer original parent id if present to avoid drift
                 j = None
-                if "parent_feature_id" in row.index:
+                if "parent_feature_id" in row.index and row["parent_feature_id"] is not None:
                     try:
-                        pid = int(row["parent_feature_id"])
-                        if 0 <= pid < len(parts_list):
-                            j = pid
+                        j = j_by_pid.get(int(row["parent_feature_id"]))
                     except Exception:
                         j = None
                 if j is None:
                     rep = row.geometry.representative_point()
                     ret = tree.nearest(rep)
-                    if isinstance(ret, (int, np.integer)):
-                        j = int(ret)
-                    else:
-                        ng = ret
-                        j = idx_by_geom.get(id(ng))
-                        if j is None:
-                            j = idx_by_wkb.get(getattr(ng, "wkb", b""), None)
-                        if j is None:
-                            dists = [rep.distance(ln) for ln in parts_list]
-                            j = int(np.argmin(dists))
-                            logger.debug("infill: STRtree id/wkb mismatch; used brute-force nearest (idx=%d)", j)
-
-                parent_feature_id = parent_ids[j]
-                line = parts_list[j]
+                    j = int(ret) if isinstance(ret, numbers.Integral) else idx_by_geom.get(id(ret))
+                if j is None:
+                    continue
+                line = parts_list[int(j)]
                 coords = list(row.geometry.coords)
                 svals = [line.project(Point(*c)) for c in coords]
-                s0, s1 = min(svals), max(svals)
-                base_intervals.setdefault(parent_feature_id, []).append((s0, s1))
-            for pid in list(base_intervals.keys()):
-                base_intervals[pid] = _merge_intervals(base_intervals[pid], gap_merge_m=1.0)
+                s0, s1 = float(min(svals)), float(max(svals))
+                base_intervals_j[int(j)].append((s0, s1))
+            # merge per j
+            for jj in list(base_intervals_j.keys()):
+                base_intervals_j[jj] = _merge_intervals(base_intervals_j[jj], gap_merge_m=1.0)
         logger.info(
-            "infill: prepared base_intervals for %d parents from %d base segments in %.1fs",
-            len([k for k, v in base_intervals.items() if v]),
+            "infill: prepared base_intervals for %d parents from %d base segments",
+            len([k for k, v in base_intervals_j.items() if v]),
             0 if base is None else len(base),
-            time.time() - t0,
         )
 
-        extra_intervals: dict[int, list[tuple[float, float]]] = {}
+        # Active parent js to evaluate
+        active_from_snapped_j = set()
+        if not snapped.empty and {"parent_feature_id", "station_m"}.issubset(snapped.columns):
+            for pid in snapped["parent_feature_id"].astype(int).unique().tolist():
+                jj = j_by_pid.get(int(pid))
+                if jj is not None:
+                    active_from_snapped_j.add(int(jj))
+        active_from_base_j = set(j for j, v in base_intervals_j.items() if v)
+        parents_j = sorted(active_from_snapped_j.union(active_from_base_j))
 
-        parents = list(set(snapped["parent_feature_id"].astype(int).tolist()))
-        n_par = len(parents)
-        last_log = time.time()
-
+        extra_intervals_j: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
         reject_logs = 0
         reason_counts = Counter()
-        for i, parent_feature_id in enumerate(parents, 1):
+
+        # Cluster low-band points per j then decide acceptability relative to base on same j
+        for jj in parents_j:
+            pid = pid_by_j[int(jj)]
             sub = snapped[
-                (snapped["parent_feature_id"].astype(int) == parent_feature_id)
-                & (snapped["runupHt"] >= ht_lo_m)
-                & (snapped["runupHt"] < ht_hi_m)
-            ]
-            if sub.empty:
-                if time.time() - last_log >= 30.0:
-                    logger.debug("infill progress: %d/%d parents processed", i, n_par)
-                    last_log = time.time()
+                (snapped["parent_feature_id"].astype(int) == pid)
+                & (snapped.get("runupHt", 0.0) >= ht_lo_m)
+                & (snapped.get("runupHt", 0.0) < ht_hi_m)
+            ] if not snapped.empty else snapped
+            if sub is None or sub.empty:
                 continue
-
-            s_vals = np.array(sub["station_m"].astype(float).tolist())
+            s_vals = np.array(sub["station_m"].astype(float).tolist(), dtype=float)
+            if s_vals.size == 0:
+                continue
             s_vals.sort()
+            # DBSCAN-like 1D clustering by gap>eps
+            breaks = np.where(np.diff(s_vals) > eps_m)[0]
+            clusters = np.split(s_vals, breaks + 1)
 
-            # form clusters by consecutive gaps ≤ eps
-            clusters: list[np.ndarray] = []
-            start = 0
-            for k in range(1, len(s_vals)):
-                if (s_vals[k] - s_vals[k - 1]) > eps_m:
-                    clusters.append(s_vals[start:k])
-                    start = k
-            clusters.append(s_vals[start:])
-
-            eps_cov = 1e-6
+            base_ivals = base_intervals_j.get(int(jj), [])
             for cl in clusters:
                 if len(cl) < int(min_samples):
-                    if _accept_singleton and len(cl) == 1:
-                        # allow to continue; will be evaluated by bridge/cover rules
-                        pass
-                    else:
+                    if not (_accept_singleton and len(cl) == 1):
                         if reject_logs < _reject_log_limit:
-                            logger.debug(
-                                "infill reject parent=%d reason=min_samples len=%d min_samples=%d",
-                                parent_feature_id, len(cl), int(min_samples)
-                            )
+                            logger.debug("infill reject pid=%d reason=min_samples len=%d min=%d", pid, len(cl), int(min_samples))
                             reject_logs += 1
                         reason_counts['min_samples'] += 1
                         continue
                 s0, s1 = float(cl[0]), float(cl[-1])
 
-                # coverage by base (robust to degeneracy)
+                # coverage fraction by base on same j
                 cover = 0.0
                 overlap_any = False
                 contains_point = False
-                if base_intervals.get(parent_feature_id):
+                if base_ivals:
                     covered = []
-                    for a, b in base_intervals[parent_feature_id]:
+                    for a, b in base_ivals:
                         if not (b < s0 or a > s1):
                             overlap_any = True
                         if a <= s0 <= b:
                             contains_point = True
                         lo, hi = max(a, s0), min(b, s1)
                         if hi >= lo:
-                            covered.append((lo, max(hi, lo + eps_cov)))
+                            covered.append((lo, max(hi, lo + 1e-6)))
                     if covered and (s1 - s0) > 0:
                         merged = _merge_intervals(covered, gap_merge_m=1.0)
                         cover_len = sum(b - a for a, b in merged)
                         cover = cover_len / max(1.0, (s1 - s0))
-
                 accept = cover >= float(majority_threshold)
 
-                # Evaluate bridge condition
-                left = right = []
-                gap = float("inf")
-                if same_parent_only and base_intervals.get(parent_feature_id):
-                    left = [b for b in base_intervals[parent_feature_id] if b[1] <= s0]
-                    right = [b for b in base_intervals[parent_feature_id] if b[0] >= s1]
+                # Bridging acceptance on same parent only
+                if same_parent_only and base_ivals:
+                    left = [b for b in base_ivals if b[1] <= s0]
+                    right = [b for b in base_ivals if b[0] >= s1]
+                    gap = float('inf')
                     if left and right:
-                        L = max(b[0] for b in left), max(b[1] for b in left)
-                        R = min(b[0] for b in right), min(b[1] for b in right)
-                        gap = max(0.0, R[0] - L[1])
+                        L_end = max(b[1] for b in left)
+                        R_start = min(b[0] for b in right)
+                        gap = max(0.0, float(R_start) - float(L_end))
                         if gap <= bridge_m:
                             if cover >= float(min_combined_coverage) or _allow_zero_cover_bridge:
                                 accept = True
-                    # Optional: allow one-sided bridging
                     if (not accept) and _bridge_one_side and (left or right):
-                        # compute smallest positive gap to one side
                         gap_left = float('inf')
                         gap_right = float('inf')
                         if left:
                             L_end = max(b[1] for b in left)
-                            gap_left = max(0.0, s0 - L_end)
+                            gap_left = max(0.0, float(s0) - float(L_end))
                         if right:
                             R_start = min(b[0] for b in right)
-                            gap_right = max(0.0, R_start - s1)
+                            gap_right = max(0.0, float(R_start) - float(s1))
                         one_gap = min(gap_left, gap_right)
                         if np.isfinite(one_gap) and one_gap <= bridge_m:
-                             if cover >= float(min_combined_coverage) or _allow_zero_cover_bridge:
-                                 accept = True
+                            if cover >= float(min_combined_coverage) or _allow_zero_cover_bridge:
+                                accept = True
 
-                # Overlap acceptance for degenerate clusters and short spans
+                # Degenerate cluster handling
+                span = float(s1 - s0)
                 if not accept:
-                    span = (s1 - s0)
-                    if span <= eps_cov and (contains_point or overlap_any):
+                    if span <= 1e-6 and (contains_point or overlap_any):
                         accept = True
-                    elif overlap_any and span > eps_cov:
-                        # if any overlap exists, accept even if left/right are empty
+                    elif overlap_any and span > 1e-6:
                         accept = True
 
-                # Nearest-base proximity for singletons with no left/right lists
-                if not accept and (s1 - s0) <= eps_cov and (not left and not right) and base_intervals.get(parent_feature_id):
-                    dists = []
-                    for a, b in base_intervals[parent_feature_id]:
-                        if a <= s0 <= b:
-                            dists.append(0.0)
-                        else:
-                            dists.append(min(abs(s0 - a), abs(s0 - b)))
-                    if dists:
-                        dmin = float(min(dists))
-                        if dmin <= bridge_m and _allow_zero_cover_bridge:
-                            accept = True
+                # Nearest-base proximity for singletons when no left/right
+                if not accept and span <= 1e-6 and (not base_ivals):
+                    # if allowed to seed without base, expand
+                    if _seed_without_base:
+                        mid = 0.5 * (s0 + s1)
+                        a = mid - 0.5 * max(_seed_min_m, span)
+                        b = mid + 0.5 * max(_seed_min_m, span)
+                        extra_intervals_j[int(jj)].append((float(a), float(b)))
+                        continue
 
                 if accept:
-                    extra_intervals.setdefault(parent_feature_id, []).append((s0, s1))
+                    extra_intervals_j[int(jj)].append((float(s0), float(s1)))
                 else:
-                    # Optional seeding when no base exists for this parent
-                    if _seed_without_base and not base_intervals.get(parent_feature_id):
-                        # Expand cluster to at least seed_min length around its center
-                        mid = 0.5 * (s0 + s1)
-                        a = mid - 0.5 * max(_seed_min_m, (s1 - s0))
-                        b = mid + 0.5 * max(_seed_min_m, (s1 - s0))
-                        extra_intervals.setdefault(parent_feature_id, []).append((a, b))
-                        continue
                     if reject_logs < _reject_log_limit:
-                        reason = []
+                        reasons = []
                         if cover < float(majority_threshold):
-                            reason.append("majority_fail")
+                            reasons.append("majority_fail")
                         if same_parent_only:
-                            if not base_intervals.get(parent_feature_id):
-                                reason.append("no_base_for_parent")
+                            if not base_ivals:
+                                reasons.append("no_base_for_parent")
                             else:
-                                if not left or not right:
-                                    reason.append("no_left_or_right")
-                                else:
-                                    if gap > bridge_m:
-                                        reason.append("bridge_gap_large")
-                                    if cover < float(min_combined_coverage) and not _allow_zero_cover_bridge:
-                                        reason.append("min_combined_cov_fail")
-                        clen_km = (s1 - s0) / 1000.0
+                                reasons.append("bridge_failed")
                         logger.debug(
-                            "infill reject parent=%d s0=%.0f s1=%.0f len_km=%.2f cover=%.2f left=%d right=%d gap_km=%.2f reasons=%s",
-                            parent_feature_id, s0, s1, clen_km, cover, len(left) if isinstance(left, list) else 0,
-                            len(right) if isinstance(right, list) else 0, (gap/1000.0 if np.isfinite(gap) else -1.0), 
-                            ",".join(reason) or "unknown"
+                            "infill reject pid=%d s0=%.0f s1=%.0f len_km=%.2f cover=%.2f reasons=%s",
+                            pid, s0, s1, (span/1000.0), cover, ",".join(reasons) or "unknown",
                         )
                         reject_logs += 1
-                        for r in reason:
+                        for r in reasons:
                             reason_counts[r] += 1
 
-            if time.time() - last_log >= 30.0:
-                logger.debug("infill progress: %d/%d parents processed", i, n_par)
-                last_log = time.time()
-
-        geoms = []
-        pids = []
         # ---------------- Bridging pass (additive) ----------------
-        # Parameters
         b_eps_m = float(getattr(opts, 'eps_km', 8.0)) * 1000.0
         delta_std_m = float(getattr(opts, 'delta_std_km', 40.0)) * 1000.0
         delta_long_m = float(getattr(opts, 'delta_long_km', 100.0)) * 1000.0
@@ -1036,28 +1026,28 @@ def infill_runup_segments(
         tau_step = float(getattr(opts, 'tau_step', 0.15))
         pad_m = min(b_eps_m, 0.5 * delta_std_m)
 
-        # Build low-band amplifiers per parent
-        low = snapped[(snapped["runupHt"] >= ht_lo_m) & (snapped["runupHt"] < ht_hi_m)] if not snapped.empty else snapped
-        svals_by_parent: Dict[int, np.ndarray] = {}
-        if low is not None and not low.empty:
-            for pid, grp in low.groupby(low["parent_feature_id"].astype(int)):
-                sarr = np.array(grp["station_m"].astype(float).tolist(), dtype=float)
-                sarr.sort()
-                svals_by_parent[int(pid)] = sarr
+        # Low-band s-values per j
+        svals_by_j: Dict[int, np.ndarray] = {}
+        if not snapped.empty:
+            low = snapped[(snapped.get("runupHt", 0.0) >= ht_lo_m) & (snapped.get("runupHt", 0.0) < ht_hi_m)]
+            if not low.empty and {"parent_feature_id", "station_m"}.issubset(low.columns):
+                for pid, grp in low.groupby(low["parent_feature_id"].astype(int)):
+                    jj = j_by_pid.get(int(pid))
+                    if jj is None:
+                        continue
+                    sarr = np.asarray(grp["station_m"].astype(float).tolist(), dtype=float)
+                    sarr.sort()
+                    svals_by_j[int(jj)] = sarr
 
-        # Iterate gaps between merged base intervals per parent and score
         def _edge_hits(sarr: np.ndarray, b0: float, a1: float, tol_m: float) -> int:
             if sarr is None or sarr.size == 0:
                 return 0
-            # count presence near each edge independently, cap at 2
             A = 0
-            # right edge of left interval (b0)
             j = int(np.searchsorted(sarr, b0))
             near = []
             if j < len(sarr): near.append(abs(sarr[j] - b0))
             if j > 0: near.append(abs(sarr[j-1] - b0))
             if near and min(near) <= tol_m: A += 1
-            # left edge of right interval (a1)
             k = int(np.searchsorted(sarr, a1))
             near2 = []
             if k < len(sarr): near2.append(abs(sarr[k] - a1))
@@ -1071,122 +1061,101 @@ def infill_runup_segments(
         unconditional_count = 0
         seed_bridge_count = 0
 
-        for parent_feature_id, ivals in base_intervals.items():
+        for jj, ivals in base_intervals_j.items():
             if not ivals or len(ivals) < 2:
                 continue
-            # ensure sorted by start
             ivals_sorted = sorted(ivals)
-            # parent line reference for cutting later
-            if parent_feature_id in parent_ids:
-                pj = parent_ids.index(parent_feature_id)
-                parent_line = parts_list[pj]
-                parent_len = parent_line.length
-            else:
-                parent_line = None
-                parent_len = None
-            sarr = svals_by_parent.get(int(parent_feature_id), np.array([], dtype=float))
-            for idx in range(len(ivals_sorted) - 1):
-                a0, b0 = ivals_sorted[idx]
-                a1, b1 = ivals_sorted[idx + 1]
+            parent_line = parts_list[int(jj)]
+            parent_len = float(len_by_j[int(jj)])
+            sarr = svals_by_j.get(int(jj), np.array([], dtype=float))
+            for k in range(len(ivals_sorted) - 1):
+                a0, b0 = ivals_sorted[k]
+                a1, b1 = ivals_sorted[k + 1]
                 L = max(0.0, float(a1) - float(b0))
                 if L <= 0:
                     continue
                 if L > delta_long_m:
-                    continue  # safety rail
+                    continue
                 A = _edge_hits(sarr, float(b0), float(a1), b_eps_m)
                 Ln = (L / delta_long_m) ** p_exp
                 S = wA * A - wL * Ln
                 accepted = False
-                # Unconditional acceptance for small gaps, if configured
+
                 unc_km = getattr(opts, 'bridge_unconditional_under_km', None)
                 if unc_km is not None:
                     try:
-                        unc_m = float(unc_km) * 1000.0
-                        if L <= unc_m:
+                        if L <= float(unc_km) * 1000.0:
                             accepted = True
                             unconditional_count += 1
                     except Exception:
                         pass
-                # Seed-assisted bridging: allow one low-band point inside the gap to split it
-                # into two sub-gaps each <= unconditional threshold (extends arbitrarily for large gaps
-                # as long as the seed creates two acceptable sub-gaps).
+
                 if (not accepted) and (unc_km is not None) and (sarr is not None) and (sarr.size > 0):
-                    # pick a seed s inside (b0, a1) minimizing the larger side
                     inside = sarr[(sarr > float(b0)) & (sarr < float(a1))]
                     if inside.size > 0:
-                        # choose seed that balances left/right
                         diffs = np.maximum(inside - float(b0), float(a1) - inside)
                         jbest = int(np.argmin(diffs))
                         s = float(inside[jbest])
                         left = s - float(b0)
                         right = float(a1) - s
-                        if left <= unc_m and right <= unc_m:
-                            # create two bridged intervals around the seed
-                            aL = float(b0) - pad_m
-                            bL = s + pad_m
-                            aR = s - pad_m
-                            bR = float(a1) + pad_m
-                            if parent_len is not None:
-                                aL = max(0.0, min(parent_len, aL))
-                                bL = max(0.0, min(parent_len, bL))
-                                aR = max(0.0, min(parent_len, aR))
-                                bR = max(0.0, min(parent_len, bR))
+                        if left <= float(unc_km) * 1000.0 and right <= float(unc_km) * 1000.0:
+                            aL = max(0.0, min(parent_len, float(b0) - pad_m))
+                            bL = max(0.0, min(parent_len, s + pad_m))
+                            aR = max(0.0, min(parent_len, s - pad_m))
+                            bR = max(0.0, min(parent_len, float(a1) + pad_m))
                             if bL > aL:
-                                extra_intervals.setdefault(parent_feature_id, []).append((aL, bL))
+                                extra_intervals_j[int(jj)].append((aL, bL))
                                 bridges_added += 1
                             if bR > aR:
-                                extra_intervals.setdefault(parent_feature_id, []).append((aR, bR))
+                                extra_intervals_j[int(jj)].append((aR, bR))
                                 bridges_added += 1
                             accepted = True
                             seed_bridge_count += 1
 
-                # Pass 1
                 if (not accepted) and (L <= delta_std_m) and (S >= tau_base):
                     accepted = True; pass_counts[0] += 1
-                # Pass 2
                 if (not accepted) and (L <= 0.5 * (delta_std_m + delta_long_m)) and (S >= (tau_base + tau_step)):
                     accepted = True; pass_counts[1] += 1
-                # Pass 3
                 if (not accepted) and (L <= delta_long_m) and (S >= (tau_base + 2.0 * tau_step)):
                     accepted = True; pass_counts[2] += 1
+
                 gaps_checked += 1
                 if accepted:
-                    a = float(b0) - pad_m
-                    b = float(a1) + pad_m
-                    # clamp to parent length
-                    if parent_len is not None:
-                        a = max(0.0, min(parent_len, a))
-                        b = max(0.0, min(parent_len, b))
+                    a = max(0.0, min(parent_len, float(b0) - pad_m))
+                    b = max(0.0, min(parent_len, float(a1) + pad_m))
                     if b > a:
-                        extra_intervals.setdefault(parent_feature_id, []).append((a, b))
+                        extra_intervals_j[int(jj)].append((a, b))
                         bridges_added += 1
-                if (gaps_checked % 2000) == 0:
-                    logger.debug(
-                        "infill bridge check #%d pid=%d L_km=%.2f A=%d S=%.3f accepted=%s",
-                        gaps_checked, int(parent_feature_id), L/1000.0, int(A), float(S), accepted,
-                    )
-        for parent_feature_id, intervals_meters in extra_intervals.items():
-            intervals_meters = _merge_intervals(intervals_meters, gap_merge_m=1.0)
-            if parent_feature_id in parent_ids:
-                j = parent_ids.index(parent_feature_id)
-                line = parts_list[j]
-                for a, b in intervals_meters:
-                    seg = _substring(line, max(0.0, a), min(line.length, b))
-                    if seg and not seg.is_empty:
-                        geoms.append(seg)
-                        pids.append(parent_feature_id)
+
+        # Emit geoms for extra_intervals_j keyed by j
+        geoms: List[object] = []
+        pids: List[int] = []
+        for jj, ivals in extra_intervals_j.items():
+            if not ivals:
+                continue
+            ivals = _merge_intervals(ivals, gap_merge_m=1.0)
+            line = parts_list[int(jj)]
+            L = float(len_by_j[int(jj)])
+            pid = pid_by_j[int(jj)]
+            for a, b in ivals:
+                a = max(0.0, min(L, float(a)))
+                b = max(0.0, min(L, float(b)))
+                if b <= a:
+                    continue
+                seg = _substring(line, float(a), float(b))
+                if seg is not None and not seg.is_empty:
+                    geoms.append(seg)
+                    pids.append(int(pid))
 
         gdf = gpd.GeoDataFrame(
             {"parent_feature_id": pids, "geometry": geoms},
             geometry="geometry",
             crs=WEBM,
         ).to_crs(WGS84)
-        # summary debug of reasons and bridges
         try:
             logger.info(
-                "infill summary: produced=%d rejects_logged=%d reason_counts=%s gaps_checked=%d bridges_added=%d pass_counts=%s unconditional=%d seed_bridges=%d",
-                0 if gdf is None or gdf.empty else len(gdf), reject_logs, dict(reason_counts),
-                gaps_checked, bridges_added, pass_counts, unconditional_count, seed_bridge_count,
+                "infill summary: produced=%d rejects_logged=%d reason_counts=%s",
+                0 if gdf is None or gdf.empty else len(gdf), _reject_log_limit, dict(reason_counts),
             )
         except Exception:
             pass
@@ -1195,10 +1164,10 @@ def infill_runup_segments(
         _stop_evt.set()
         _hb_thread.join(timeout=1.0)
         logger.info(
-            "<<< exited infill_runup_segments in %.1fs: produced %d segments",
+            "<<< exited infill_runup_segments in %.1fs",
             time.time() - _start_ts,
-            0 if 'gdf' not in locals() or gdf is None else (0 if getattr(gdf, 'empty', False) else len(gdf)),
         )
+
 
 # ---------- inland polygons from runup segments ----------
 
@@ -1321,7 +1290,7 @@ def infill_bridge_rulebased(
     eps_edge_km: float = 10.0,
     ht_lo_m: float = 0.2,
     ht_hi_m: float = 0.5,
-    same_parent_only: bool = True,
+    same_parent_only: bool = False,
     allow_cross_parent: bool = True,
     use_rays_seeds: bool = True,
     use_lowht_seed: bool = True,
@@ -1350,6 +1319,11 @@ def infill_bridge_rulebased(
     with tm("bridge:parts_3857"):
         parts_meters, parent_ids = _coast_parts_3857(coast)
     parts_list = list(parts_meters)
+    j_by_pid = {int(pid): j for j, pid in enumerate(parent_ids)}
+    len_by_j = np.asarray([float(g.length) for g in parts_list], dtype=float)
+    from pyproj import Transformer
+    _tf_3857_to_4326 = Transformer.from_crs(WEBM, WGS84, always_xy=True).transform
+
     t_graph = time.time()
     coast_graph = build_coast_graph_from_coast(coast, log_timing=log_timing)  # coast_lines is WGS84 GeoSeries
     if log_timing:
@@ -1362,7 +1336,7 @@ def infill_bridge_rulebased(
             logger.info("coast_graph built in %.2fs", time.time() - t_graph)
 
     # Build base intervals per parent (meters alongshore)
-    base_intervals: Dict[int, List[Tuple[float, float]]] = {}
+    base_intervals_j: Dict[int, List[Tuple[float, float]]] = {}
     with tm("bridge:base_to_metric"):
         base_m = to_metric(base)
     for _, row in base_m.iterrows():
@@ -1370,9 +1344,7 @@ def infill_bridge_rulebased(
         j = None
         if "parent_feature_id" in row.index:
             try:
-                pid = int(row["parent_feature_id"])
-                if 0 <= pid < len(parts_list):
-                    j = pid
+                j = j_by_pid.get(int(row["parent_feature_id"]))
             except Exception:
                 j = None
         if j is None:
@@ -1386,11 +1358,11 @@ def infill_bridge_rulebased(
         coords = list(row.geometry.coords)
         svals = [line.project(Point(*c)) for c in coords]
         s0, s1 = float(min(svals)), float(max(svals))
-        base_intervals.setdefault(int(j), []).append((s0, s1))
+        base_intervals_j.setdefault(int(j), []).append((s0, s1))
 
     # Merge base intervals
-    for pid in list(base_intervals.keys()):
-        base_intervals[pid] = _h_merge_intervals(base_intervals[pid], gap_merge_m=1.0)
+    for pid in list(base_intervals_j.keys()):
+        base_intervals_j[pid] = _h_merge_intervals(base_intervals_j[pid], gap_merge_m=1.0)
 
     # Collect amplifiers per parent: low-Ht runups and ray hits, as station arrays
     ampl_by_parent: Dict[int, np.ndarray] = {}
@@ -1419,7 +1391,7 @@ def infill_bridge_rulebased(
     total_gaps = 0
     bridged_gaps = 0
     added_km = 0.0
-    base_km = sum((b - a) for iv in base_intervals.values() for (a, b) in iv) / 1000.0
+    base_km = sum((b - a) for iv in base_intervals_j.values() for (a, b) in iv) / 1000.0
 
     # Per-gap decision records
     decisions: List[Dict[str, object]] = []
@@ -1428,19 +1400,20 @@ def infill_bridge_rulebased(
     right_pts_m: list[tuple[int, float, object, object]] = []  # (pid, s_right, point_m, point_wgs)
     left_pts_m: list[tuple[int, float, object, object]] = []   # (pid, s_left, point_m, point_wgs)
 
-    for pid, ivals in base_intervals.items():
+    _last_hb = time.time()
+    for pid, ivals in base_intervals_j.items():
+        if _trace_enabled and (time.time() - _last_hb) > 30.0:
+            logger.debug("bridge hb: pid=%d gaps_so_far=%d bridged=%d", int(pid), total_gaps, bridged_gaps)
+            _last_hb = time.time()
         if not ivals or len(ivals) < 2:
-            # Still record endpoints for cross-parent bridging
+            # Still record endpoints
+            j = int(pid)
+            line = parts_list[j]
             for a, b in sorted(ivals):
-                if pid in parent_ids:
-                    j = parent_ids.index(pid)
-                    line = parts_list[j]
-                    pm_r = line.interpolate(float(b))
-                    pm_l = line.interpolate(float(a))
-                    pw_r = gpd.GeoSeries([pm_r], crs=WEBM).to_crs(WGS84).iloc[0]
-                    pw_l = gpd.GeoSeries([pm_l], crs=WEBM).to_crs(WGS84).iloc[0]
-                    right_pts_m.append((int(pid), float(b), pm_r, pw_r))
-                    left_pts_m.append((int(pid), float(a), pm_l, pw_l))
+                pm_r = line.interpolate(float(b)); pm_l = line.interpolate(float(a))
+                xr, yr = _tf_3857_to_4326(pm_r.x, pm_r.y); xl, yl = _tf_3857_to_4326(pm_l.x, pm_l.y)
+                right_pts_m.append((j, float(b), pm_r, Point(xr, yr)))
+                left_pts_m.append((j, float(a), pm_l, Point(xl, yl)))
             continue
 
         ivals_sorted = sorted(ivals)
@@ -1524,127 +1497,206 @@ def infill_bridge_rulebased(
             decisions.append(rec)
 
         # Record endpoints for cross-parent bridging
-        if pid in parent_ids:
-            j = parent_ids.index(pid)
-            line = parts_list[j]
-            for a, b in ivals_sorted:
-                pm_r = line.interpolate(float(b))
-                pm_l = line.interpolate(float(a))
-                pw_r = gpd.GeoSeries([pm_r], crs=WEBM).to_crs(WGS84).iloc[0]
-                pw_l = gpd.GeoSeries([pm_l], crs=WEBM).to_crs(WGS84).iloc[0]
-                right_pts_m.append((int(pid), float(b), pm_r, pw_r))
-                left_pts_m.append((int(pid), float(a), pm_l, pw_l))
+        j = int(pid)
+        line = parts_list[j]
+        for a, b in ivals_sorted:
+            pm_r = line.interpolate(float(b)); pm_l = line.interpolate(float(a))
+            xr, yr = _tf_3857_to_4326(pm_r.x, pm_r.y); xl, yl = _tf_3857_to_4326(pm_l.x, pm_l.y)
+            right_pts_m.append((j, float(b), pm_r, Point(xr, yr)))
+            left_pts_m.append((j, float(a), pm_l, Point(xl, yl)))
 
     # Merge intervals per parent and cut substrings
     geoms = []
     pids = []
-    for pid, ivals in extra_by_parent.items():
+    for j_key, ivals in extra_by_parent.items():
         ivals = _h_merge_intervals(ivals, gap_merge_m=1.0)
-        if pid in parent_ids:
-            j = parent_ids.index(pid)
-            line = parts_list[j]
-            with tm("bridge:cut_substrings"):
-                for a, b in ivals:
-                    a = max(0.0, min(line.length, float(a)))
-                    b = max(0.0, min(line.length, float(b)))
-                    if b <= a:
-                        continue
-                    seg = _substring(line, float(a), float(b))
-                    if seg and not seg.is_empty:
-                        geoms.append(seg)
-                        pids.append(int(pid))
+        j = int(j_key)
+        line = parts_list[j]
+        with tm("bridge:cut_substrings"):
+            L = float(len_by_j[j])
+            for a, b in ivals:
+                a = max(0.0, min(L, float(a)))
+                b = max(0.0, min(L, float(b)))
+                if b <= a:
+                    continue
+                seg = _substring(line, float(a), float(b))
+                if seg and not seg.is_empty:
+                    geoms.append(seg)
+                    pids.append(int(parent_ids[j]))
 
-    # Optional cross-parent bridges (conservative straight chord with coastal cap)
+        # Optional cross-parent bridges (conservative straight chord with coastal cap)
     t_cp = time.time()
-    if allow_cross_parent and right_pts_m and left_pts_m:
-        try:
-            seen = set()
-            left_geoms_m = [pm for (_pid, _s, pm, _pw) in left_pts_m]
+    cp_bridges = 0
+    right_pts_m = right_pts_m if 'right_pts_m' in locals() else []
+    left_pts_m  = left_pts_m  if 'left_pts_m'  in locals() else []
+    try:
+        if allow_cross_parent and right_pts_m and left_pts_m:
+            import numbers
+            from shapely.strtree import STRtree
+
+            left_geoms_m = [pm for (_j_l, _s, pm, _pw) in left_pts_m]
             left_tree = STRtree(left_geoms_m)
             left_idx_by_id = {id(g): i for i, g in enumerate(left_geoms_m)}
-            cp_bridges = 0
-            t_batch = time.time()
+            left_xy = np.asarray([(p.x, p.y) for p in left_geoms_m], dtype=float)
 
-            for pid_r, s_r, pm_r, pw_r in right_pts_m:
-                # Query candidates within buffer; normalize to list
-                query_geom = pm_r.buffer(delta_max_m)
-                cand = left_tree.query(query_geom)
+            delta_max_m = float(delta_max_km * 1000.0)
+            near_gate_lo = 0.9 * delta_max_m  
+            K = 10
 
-                # Normalize to Python list for safe truthiness and indexing
-                if hasattr(cand, "tolist"):
-                    cand = cand.tolist()
+            # Build the coastal graph once
+            coast_graph = coast_graph if 'coast_graph' in locals() else build_coast_graph_from_coast(coast)
 
-                idxs: list[int] = []
-                if len(cand) > 0 and isinstance(cand[0], numbers.Integral):
-                    # Some Shapely builds return integer indices
-                    idxs = [int(i) for i in cand]
+            # graph indices (CoastGraph, not networkx)
+            comp_label = coast_graph.node_comp_id  # list[int], index by node id
+
+            # nearest-node cache over CoastGraph node coordinates
+            node_points = [Point(x, y) for (x, y) in coast_graph.nodes_xy]
+            nodes_tree = STRtree(node_points)
+            node_ids = list(range(len(node_points)))
+            idx_by_geom_node = {id(g): i for i, g in enumerate(node_points)}
+            _nn_cache = {}
+
+            def nearest_node(pt: Point) -> int | None:
+                key = (round(pt.x, 1), round(pt.y, 1))
+                nid = _nn_cache.get(key)
+                if nid is not None:
+                    return nid
+                g = nodes_tree.nearest(pt)
+                idx = idx_by_geom_node.get(id(g))
+                nid = node_ids[int(idx)] if idx is not None else None
+                _nn_cache[key] = nid
+                return nid
+
+            def nearest_node(pt):
+                key = (round(pt.x, 1), round(pt.y, 1))
+                nid = _nn_cache.get(key)
+                if nid is not None:
+                    return nid
+                g = nodes_tree.nearest(pt)
+                idx = idx_by_geom_node.get(id(g))
+                nid = node_ids[int(idx)] if idx is not None else None
+                _nn_cache[key] = nid
+                return nid
+
+            seen = set()
+            if _trace_enabled():
+                # how many endpoints per parent
+                cnt_r = Counter([int(j) for (j,_,_,_) in right_pts_m])
+                cnt_l = Counter([int(j) for (j,_,_,_) in left_pts_m])
+                parents_r = set(cnt_r.keys()); parents_l = set(cnt_l.keys())
+                crossable = len(parents_r.intersection(parents_l))  # should be > 1 to be interesting
+                logger.debug("cp: parents_right=%d parents_left=%d intersect=%d", len(parents_r), len(parents_l), crossable)
+
+            for j_r, s_r, pm_r, pw_r in right_pts_m:
+                xr, yr = pm_r.x, pm_r.y
+
+                # box query
+                cand = left_tree.query(box(xr - delta_max_m, yr - delta_max_m, xr + delta_max_m, yr + delta_max_m))
+                if hasattr(cand, "tolist"): cand = cand.tolist()
+                cand = list(cand or [])
+                if _trace_enabled():
+                    logger.debug("cp[%d]: box=%d", int(j_r), len(cand))
+                if not cand:
+                    continue
+
+                # indices
+                if cand and isinstance(cand[0], numbers.Integral):
+                    idxs = np.asarray([int(i) for i in cand], dtype=int)
                 else:
-                    # Otherwise we got geometries; map back to indices
-                    for g in cand:
-                        ii = left_idx_by_id.get(id(g))
-                        if ii is not None:
-                            idxs.append(ii)
+                    idxs = np.asarray([left_idx_by_id.get(id(g)) for g in cand if left_idx_by_id.get(id(g)) is not None], dtype=int)
+                if idxs.size == 0:
+                    if _trace_enabled(): logger.debug("cp[%d]: idxs=0", int(j_r))
+                    continue
 
-                if not idxs:
-                    big_r = max(delta_max_m * 4.0, 1_000_000.0)  # 4× or ≥1000 km
-                    cand2 = left_tree.query(pm_r.buffer(big_r))
-                    if hasattr(cand2, "tolist"):
-                        cand2 = cand2.tolist()
-                    if cand2:
-                        if isinstance(cand2[0], numbers.Integral):
-                            idxs = [int(i) for i in cand2]
-                        else:
-                            idxs = [left_idx_by_id.get(id(g)) for g in cand2 if left_idx_by_id.get(id(g)) is not None]
+                # distances and radius cut
+                dx = left_xy[idxs, 0] - xr; dy = left_xy[idxs, 1] - yr
+                d = np.hypot(dx, dy)
+                keep = d <= delta_max_m
+                if not np.any(keep):
+                    if _trace_enabled(): logger.debug("cp[%d]: within_cap=0", int(j_r))
+                    continue
+                idxs = idxs[keep]; d = d[keep]
+                if _trace_enabled():
+                    logger.debug("cp[%d]: within_cap=%d d_min=%.0f d_med=%.0f", int(j_r), idxs.size, float(d.min()), float(np.median(d)))
 
-                # Fallback 2: top-K by Euclidean distance (O(n), fine at this scale)
-                if not idxs:
-                    K = 50
-                    dists = [(i, float(pm_r.distance(left_geoms_m[i]))) for i in range(len(left_geoms_m))]
-                    dists.sort(key=lambda t: t[1])
-                    idxs = [i for i, _ in dists[:K]]
+                # remove same-parent here and report
+                same_parent = (np.asarray([left_pts_m[int(i)][0] for i in idxs], dtype=int) == int(j_r))
+                if np.any(same_parent):
+                    idxs = idxs[~same_parent]; d = d[~same_parent]
+                if _trace_enabled():
+                    logger.debug("cp[%d]: after_same_parent=%d", int(j_r), idxs.size)
+                if idxs.size == 0:
+                    continue
 
-                for idx in idxs:
-                    pid_l, s_l, pm_l, pw_l = left_pts_m[idx]
-                    if pid_l == pid_r:
+                # component precheck in bulk
+                comp_ok = []
+                for li in idxs.tolist():
+                    j_l, s_l, pm_l, _ = left_pts_m[int(li)]
+                    u = nearest_node(pm_r); v = nearest_node(pm_l)
+                    if (u is None) or (v is None):
                         continue
-                    key = tuple(sorted([(pid_r, s_r), (pid_l, s_l)]))
+                    try:
+                        if comp_label[u] != comp_label[v]:
+                            continue
+                    except Exception:
+                        pass
+                    comp_ok.append(li)
+                if _trace_enabled():
+                    logger.debug("cp[%d]: after_comp=%d", int(j_r), len(comp_ok))
+                if not comp_ok:
+                    continue
+
+                idxs = np.asarray(comp_ok, dtype=int)
+                d = np.asarray([float(np.hypot(left_xy[i,0]-xr, left_xy[i,1]-yr)) for i in idxs], dtype=float)
+
+                # density-aware budget
+                area = math.pi * (delta_max_m ** 2)
+                rho = (len(idxs) / area) if area > 0 else 1.0
+                Kloc = int(np.clip(math.ceil(8.0 / max(rho, 1e-6)), 6, 24))
+                if len(idxs) > Kloc:
+                    part = np.argpartition(d, Kloc - 1)[:Kloc]
+                    idxs, d = idxs[part], d[part]
+                order = np.argsort(d); idxs, d = idxs[order], d[order]
+                if _trace_enabled():
+                    logger.debug("cp[%d]: final_cand=%d Kloc=%d", int(j_r), len(idxs), Kloc)
+
+                for li, d_webm in zip(idxs.tolist(), d.tolist()):
+                    j_l, s_l, pm_l, pw_l = left_pts_m[int(li)]
+                    key = (int(j_r), int(j_l), float(s_r), float(s_l))
                     if key in seen:
                         continue
+                    seen.add(key)
 
-                    # Distance check in WEBM
-                    try:
-                        dist = float(pm_r.distance(pm_l))
-                    except Exception:
+                    win = float(min(delta_max_m, max(d_webm * 1.5, 2000.0)))
+                    with _trace("cp:route_try", jr=int(j_r), jl=int(j_l), d=int(d_webm)):
+                        path_m = route_along_coast_astar(
+                            coast_graph, pm_r, pm_l,
+                            delta_max_m=delta_max_m, window_m=win, log_timing=True
+                        )
+                    if path_m is None:
                         continue
-                    # Route along coastline (A*) with distance cap
-                    t_route = time.time()
-                    path_m = route_along_coast_astar(
-                        coast_graph,          # built once earlier in this function
-                        pm_r, pm_l,           # WEBM points
-                        delta_max_m=float(delta_max_km) * 1000.0,
-                        split_tol_m=5.0,
-                        window_m=(float(delta_max_km) + 10.0) * 1000.0,
-                    )
-                    if path_m is not None and (not path_m.is_empty):
-                        geoms.append(path_m)      # WEBM geometry
-                        pids.append(-1)           # mark cross-parent
-                        seen.add(key)
-                        cp_bridges += 1
-                    if log_timing:
-                        logger.debug("route call #%d: %s in %.3fs",
-                                    cp_bridges,
-                                    "hit" if (path_m is not None and not path_m.is_empty) else "miss",
-                                    time.time() - t_route)
 
-            logger.info(
-                "cross_parent summary: endpoints_right=%d endpoints_left=%d cp_bridges=%d",
-                len(right_pts_m), len(left_pts_m), cp_bridges
-            )
-        except Exception:
-            logger.exception("cross_parent bridging failed")
+                    geoms.append(path_m)
+                    pids.append(int(parent_ids[int(j_r)]))
+                    cp_bridges += 1
+                    break
 
-    out = gpd.GeoDataFrame({"parent_feature_id": pids, "geometry": geoms}, geometry="geometry", crs=WEBM).to_crs(WGS84) if geoms else gpd.GeoDataFrame(geometry=[], crs=WGS84)
 
+        logger.info(
+            "cross_parent summary: endpoints_right=%d endpoints_left=%d cp_bridges=%d",
+            len(right_pts_m), len(left_pts_m), cp_bridges
+        )
+    except Exception:
+        logger.exception("cross_parent bridging failed")
+
+    out = gpd.GeoDataFrame(
+        {
+            "parent_feature_id": pids, 
+            "geometry": geoms
+        },
+        geometry="geometry", 
+        crs=WEBM
+    ).to_crs(WGS84) if geoms else gpd.GeoDataFrame(geometry=[], crs=WGS84)
     # Decision logs
     try:
         fails = [d for d in decisions if not d.get("pass")]
@@ -1660,6 +1712,6 @@ def infill_bridge_rulebased(
 
     logger.info(
         "infill_bridge_rulebased: parents=%d total_gaps=%d bridged_gaps=%d added_km=%.1f base_km=%.1f elapsed=%.1fs",
-        len(base_intervals), total_gaps, bridged_gaps, added_km, base_km, time.time() - t0
+        len(base_intervals_j), total_gaps, bridged_gaps, added_km, base_km, time.time() - t0
     )
     return out
