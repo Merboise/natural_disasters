@@ -4,16 +4,35 @@ import json
 import hashlib
 import threading
 import time
+import math
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, List, Dict, Any
 
 import geopandas as gpd
 import numpy as np
-from shapely.geometry import LineString, base
+from shapely.geometry import LineString, base, Point
 from shapely.strtree import STRtree
 
 WGS84 = "EPSG:4326"
 WEBM  = "EPSG:3857"
+
+@dataclass
+class _Edge:
+    u: int
+    v: int
+    length: float
+    geom: LineString           # metric CRS (WEBM)
+    parent_idx: int            # index in parts list
+    parent_feature_id: int     # original parent_feature_id
+
+@dataclass
+class CoastGraph:
+    nodes_xy: List[Tuple[float, float]]    # node_id -> (x,y)
+    edges: List[_Edge]                     # edge_id -> edge
+    node_edges: List[List[int]]            # node_id -> [edge_ids]
+    edge_tree: STRtree                    # STRtree over edge geoms
+    edge_idx_by_id: Dict[int, int]         # id(geom) -> edge_id
+    node_comp_id: List[int]                # node_id -> component id
 
 def _ensure_wgs84(gs: gpd.GeoSeries | gpd.GeoDataFrame) -> gpd.GeoSeries:
     if isinstance(gs, gpd.GeoDataFrame):
@@ -56,6 +75,100 @@ def _hash_coast(gs: gpd.GeoSeries, simplify_m: float) -> str:
         h.update(wkb[-100:])
     return h.hexdigest()[:16]  
 
+def _dsu_build(n: int):
+        p = list(range(n))
+        r = [0]*n
+        def f(x):
+            while p[x] != x:
+                p[x] = p[p[x]]
+                x = p[x]
+            return x
+        def u(a,b):
+            ra, rb = f(a), f(b)
+            if ra == rb: return
+            if r[ra] < r[rb]: p[ra] = rb
+            elif r[ra] > r[rb]: p[rb] = ra
+            else: p[rb] = ra; r[ra]+=1
+        return f, u
+
+def _build_stitched_graph(parts_m, part_ids, *, snap_m: float):
+        # grid-bucket endpoints → union-find stitch (faster than N^2 buffers)
+
+        def cell(pt):
+            return (math.floor(pt.x / snap_m), math.floor(pt.y / snap_m))
+
+        ends = []        # Points
+        owner = []       # (edge_idx, 'u'/'v')
+        for i, ln in enumerate(parts_m):
+            if not ln or ln.is_empty: continue
+            p0, p1 = Point(ln.coords[0]), Point(ln.coords[-1])
+            ends.extend([p0, p1])
+            owner.extend([(i,'u'), (i,'v')])
+
+        n = len(ends)
+        parent = list(range(n))
+        def find(x):
+            while parent[x]!=x:
+                parent[x]=parent[parent[x]]; x=parent[x]
+            return x
+        def unite(a,b):
+            ra, rb = find(a), find(b)
+            if ra!=rb: parent[rb]=ra
+
+        buckets = {}
+        for idx, p in enumerate(ends):
+            buckets.setdefault(cell(p), []).append(idx)
+
+        # neighbor cells 3x3 around each endpoint
+        for idx, p in enumerate(ends):
+            cx, cy = cell(p)
+            for dx in (-1,0,1):
+                for dy in (-1,0,1):
+                    lst = buckets.get((cx+dx, cy+dy))
+                    if not lst: continue
+                    for j in lst:
+                        if j == idx: continue
+                        if p.distance(ends[j]) <= snap_m:
+                            unite(idx, j)
+
+        # canonical node ids
+        canon = [find(i) for i in range(n)]
+        node_map = {}
+        nodes_xy = []
+        for i, ci in enumerate(canon):
+            if ci not in node_map:
+                node_map[ci] = len(nodes_xy)
+                nodes_xy.append((ends[i].x, ends[i].y))
+
+        # edges with stitched endpoints
+        edges = []
+        node_edges = [[] for _ in range(len(nodes_xy))]
+        for i, ln in enumerate(parts_m):
+            if not ln or ln.is_empty: continue
+            u = node_map[canon[2*i+0]]
+            v = node_map[canon[2*i+1]]
+            eidx = len(edges)
+            edges.append(_Edge(u=u, v=v, length=float(ln.length), geom=ln,
+                            parent_idx=i, parent_feature_id=int(part_ids[i])))
+            node_edges[u].append(eidx); node_edges[v].append(eidx)
+
+        # components
+        find2, unite2 = _dsu_build(len(nodes_xy))
+        for e in edges: unite2(e.u, e.v)
+        comp = [find2(i) for i in range(len(nodes_xy))]
+
+        # edge STRtree + id map
+        edge_geoms = [e.geom for e in edges]
+        edge_tree = STRtree(edge_geoms)
+        edge_idx_by_id = {id(g): i for i, g in enumerate(edge_geoms)}
+
+        return CoastGraph(nodes_xy=nodes_xy, edges=edges, node_edges=node_edges,
+                        edge_tree=edge_tree, edge_idx_by_id=edge_idx_by_id,
+                        node_comp_id=comp)
+
+def set_default_simplify_m(self, val: float):
+    with self._lock:
+        self._default_simplify_m = float(val)
 
 @dataclass(frozen=True)
 class CoastBase3857:
@@ -76,6 +189,9 @@ class TsunamiMemCache:
         self._lock = threading.RLock()
         self._store: Dict[Tuple[str, float], CoastBase3857] = {}
         self._stats = {"builds": 0, "hits": 0, "misses": 0}
+        self._idmaps: Dict[Tuple[str, float], Dict[int, int]] = {}
+        self._graphs = {}
+        self._default_simplify_m = 0.0
 
     # Public API --------------------------------------------------------------
     def get_parts_3857_and_tree(self, coast_wgs: gpd.GeoSeries | gpd.GeoDataFrame,
@@ -163,3 +279,54 @@ class TsunamiMemCache:
             self._store[k] = cb
             self._stats["builds"] += 1
         return cb
+
+    def _ensure_idmap(self, cb: CoastBase3857) -> Dict[int, int]:
+        k = (cb.key, float(cb.simplify_m))
+        with self._lock:
+            m = self._idmaps.get(k)
+            if m is None:
+                m = {id(g): i for i, g in enumerate(cb.parts_m)}
+                self._idmaps[k] = m
+            return m
+
+    def get_tree_and_index_map(self, coast_wgs, *, simplify_m: float = 0.0):
+        """Return (strtree_m, idmap, key). Geometries must be in metric (WEBM) for tree.nearest()."""
+        cb = self._get_or_build(coast_wgs, simplify_m=simplify_m)
+        idmap = self._ensure_idmap(cb)
+        return cb.strtree_m, idmap, cb.key
+
+    def get_parts_tree_index(self, coast_wgs, *, simplify_m: float = 0.0):
+        """Return (parts_m, part_ids, strtree_m, idmap, key)."""
+        cb = self._get_or_build(coast_wgs, simplify_m=simplify_m)
+        idmap = self._ensure_idmap(cb)
+        part_ids = list(range(len(cb.parts_m)))
+        return cb.parts_m, part_ids, cb.strtree_m, idmap, cb.key
+
+    def nearest_part_idx_metric(self, coast_wgs, geom_m, *, simplify_m: float = 0.0) -> int:
+        """Nearest exploded-part index for a METRIC geometry."""
+        cb = self._get_or_build(coast_wgs, simplify_m=simplify_m)
+        idmap = self._ensure_idmap(cb)
+        near = cb.strtree_m.nearest(geom_m)
+        idx = idmap.get(id(near))
+        if idx is not None:
+            return idx
+        # rare fallback if identity changed
+        import numpy as _np
+        d = [_np.inf if g is None else geom_m.distance(g) for g in cb.parts_m]
+        return int(_np.argmin(d))
+    
+    def get_coast_graph(self, coast_wgs, *, simplify_m: float | None = None, snap_m: float = 250.0):
+        sm = self._default_simplify_m if simplify_m is None else float(simplify_m)
+        cb = self._get_or_build(coast_wgs, simplify_m=sm)
+        k = (cb.key, sm, float(snap_m))
+        with self._lock:
+            g = self._graphs.get(k)
+            if g is not None:
+                return g
+            part_ids = list(range(len(cb.parts_m)))  # <-- fix
+            g = _build_stitched_graph(cb.parts_m, part_ids, snap_m=float(snap_m))  # <-- call module fn
+            self._graphs[k] = g
+            return g
+
+    
+_MC = TsunamiMemCache()  # singleton instance

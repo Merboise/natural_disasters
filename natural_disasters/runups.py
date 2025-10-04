@@ -1,8 +1,8 @@
 # runups.py
 from __future__ import annotations
-import math, numbers, logging, time, heapq
+import math, numbers, logging, time, heapq, inspect
 from dataclasses import dataclass
-from typing import Iterable, List, Tuple, Optional, Dict
+from typing import Iterable, List, Tuple, Optional, Dict, Set
 from collections import defaultdict, Counter
 from contextlib import contextmanager, nullcontext
 from .infill_config import InfillConfig
@@ -11,7 +11,6 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import os
-import networkx as nx
 import threading
 from collections import Counter
 from shapely.geometry import Point, LineString, Polygon, box
@@ -31,10 +30,7 @@ from .tsunami_helpers import (
     _timer as _h_timer,
     _log_gdf as _h_log_gdf,
 )
-from .tsunami_mem_cache import TsunamiMemCache
-
-# Singleton in-memory coastline cache
-_MC = TsunamiMemCache()
+from .tsunami_mem_cache import TsunamiMemCache, _MC
 
 WGS84 = 4326
 WEBM = 3857
@@ -66,6 +62,21 @@ def _maybe_timer(tag: str, enabled: bool):
     Conditional timer helper so callers can do:  with _maybe_timer('tag', log_timing): ...
     """
     return _timer(tag) if enabled else nullcontext()
+
+try:
+    if " _maybe_timer" in globals():
+        pass
+except NameError:
+    pass
+
+if " _maybe_timer" in globals():
+    _mt = globals()["_maybe_timer"]
+    if inspect.isgeneratorfunction(_mt):
+        globals()["_maybe_timer"] = contextmanager(_mt)
+else:
+    # fallback shim if _maybe_timer is absent
+    def _maybe_timer(tag: str, enabled: bool):
+        return nullcontext()
 
 def _log_gdf(tag, gdf):
     return _h_log_gdf(tag, gdf)
@@ -100,6 +111,34 @@ def to_metric(g):
 
 def to_wgs(g):
     return _h_to_wgs(g)
+
+try:
+    from shapely.ops import substring as _substring
+except Exception:
+    def _substring(ls, s0, s1):
+        # simple meters-based slice of a LineString
+        from shapely.geometry import LineString, Point
+        if s0 == s1: return Point(ls.interpolate(s0))
+        if s0 > s1: s0, s1 = s1, s0
+        coords = [ls.coords[0]]
+        acc = 0.0
+        out = []
+        for (x0,y0),(x1,y1) in zip(ls.coords[:-1], ls.coords[1:]):
+            seg = ((x0,y0),(x1,y1))
+            dx, dy = (x1-x0), (y1-y0)
+            L = (dx*dx+dy*dy)**0.5
+            if L == 0: continue
+            n0, n1 = acc, acc+L
+            # segment overlaps [s0,s1]?
+            a = max(s0, n0); b = min(s1, n1)
+            if a < b:
+                t0 = (a-n0)/L; t1 = (b-n0)/L
+                xa, ya = x0+dx*t0, y0+dy*t0
+                xb, yb = x0+dx*t1, y0+dy*t1
+                if not out: out.append((xa,ya))
+                out.append((xb,yb))
+            acc = n1
+        return LineString(out) if len(out) > 1 else Point(out[0])
 
 def _coast_parts_3857(coast_lines: gpd.GeoSeries):
     """Wrapper: retrieve exploded 3857 parts and parent ids from in-memory cache."""
@@ -142,116 +181,104 @@ def _dsu_build(n: int):
         else: p[rb] = ra; r[ra]+=1
     return f, u
 
-def build_coast_graph_from_coast(coast_lines_wgs: "gpd.GeoSeries",
-                                 *,
-                                 snap_m: float = 15.0,
-                                 simplify_m: float = 0.0,
-                                 log_timing: bool = False) -> CoastGraph:
-    """
-    Build a coastline graph once from WGS84 coast lines.
-    Nodes = snapped endpoints of parts. Edges = parts geometries in WEBM.
-    """
-    with _maybe_timer("coast_graph:get_parts_3857", log_timing):
-        parts_meters, parent_ids = _coast_parts_3857(ensure_wgs84(coast_lines_wgs))
-    # memo key: (count, hash of bounds roughly, ...)
-    bounds = [g.bounds if g is not None and not g.is_empty else (0,0,0,0) for g in parts_meters]
-    if bounds:
-        xs = [int(b[0]) for b in bounds] + [int(b[2]) for b in bounds]
-        ys = [int(b[1]) for b in bounds] + [int(b[3]) for b in bounds]
-        k = (len(parts_meters), min(xs), min(ys), max(xs), float(snap_m))
-    else:
-        k = (0,0,0,0,float(snap_m))
-    if k in _COAST_GRAPH_MEMO:
-        return _COAST_GRAPH_MEMO[k]
+# add at top of runups.py if not present
+# from .tsunami_mem_cache import _MC  # if _MC already imported skip
 
-    nodes: Dict[Tuple[int,int], int] = {}          # snapped key -> node_id
-    nodes_xy: List[Tuple[float,float]] = []
-    edges: List[_Edge] = []
-    node_edges: List[List[int]] = []
+#def build_coast_graph_from_coast(coast_lines_gs, *, snap_m: float = 250.0, log_timing: bool = False):
+    import time, logging, geopandas as gpd
+    from shapely.geometry import Point
+    from shapely.strtree import STRtree
+    logger = logging.getLogger("natural_disasters.coast_graph")
 
-    def _get_node(pt: Point) -> int:
-        key = _snap_key(pt, snap_m)
-        nid = nodes.get(key)
-        if nid is not None:
-            return nid
-        nid = len(nodes_xy)
-        nodes[key] = nid
-        nodes_xy.append((pt.x, pt.y))
-        node_edges.append([])
-        return nid
+    t0 = time.time()
+    coast_wgs = gpd.GeoSeries(ensure_wgs84(coast_lines_gs)) \
+        if not isinstance(coast_lines_gs, gpd.GeoSeries) else ensure_wgs84(coast_lines_gs)
 
-    # build nodes+edges
-    with _maybe_timer("coast_graph:get_parts_3857", log_timing):
-        for i, g in enumerate(parts_meters):
-            if g is None or g.is_empty:
-                continue
-            ls = g
-            if simplify_m > 0.0:
-                ls = g.simplify(simplify_m, preserve_topology=True)
-                if ls.is_empty:
-                    continue
-            if ls.geom_type == "MultiLineString":
-                for sub in ls.geoms:
-                    if sub.is_empty: continue
-                    p0 = Point(sub.coords[0]); p1 = Point(sub.coords[-1])
-                    u = _get_node(p0); v = _get_node(p1)
-                    e = _Edge(u=u, v=v, length=float(sub.length), geom=sub,
-                            parent_idx=i, parent_feature_id=int(parent_ids[i]))
-                    eid = len(edges)
-                    edges.append(e)
-                    node_edges[u].append(eid)
-                    node_edges[v].append(eid)
-            elif ls.geom_type == "LineString":
-                p0 = Point(ls.coords[0]); p1 = Point(ls.coords[-1])
-                u = _get_node(p0); v = _get_node(p1)
-                e = _Edge(u=u, v=v, length=float(ls.length), geom=ls,
-                        parent_idx=i, parent_feature_id=int(parent_ids[i]))
-                eid = len(edges)
-                edges.append(e)
-                node_edges[u].append(eid)
-                node_edges[v].append(eid)
+    parts_m, part_ids, _parts_tree, _idmap, _key = _MC.get_parts_tree_index(
+        gpd.GeoDataFrame(geometry=coast_wgs, crs=WGS84), simplify_m=0.0
+    )
 
-    # components on nodes (union endpoints for each edge)
-    with _maybe_timer("coast_graph:components", log_timing):
-        find, unite = _dsu_build(len(nodes_xy))
-        for e in edges:
-            unite(e.u, e.v)
-        roots: Dict[int,int] = {}
-        node_comp_id = [0]*len(nodes_xy)
-        for nid in range(len(nodes_xy)):
-            r = find(nid)
-            if r not in roots: roots[r] = len(roots)
-            node_comp_id[nid] = roots[r]
+    def _snap_xy(pt): return (round(pt.x/snap_m)*snap_m, round(pt.y/snap_m)*snap_m)
 
-    # edge spatial index
-    with _maybe_timer("coast_graph:edge_strtree", log_timing):
-        edge_geoms = [e.geom for e in edges]
-        edge_tree = STRtree(edge_geoms)
+    nodes_xy, node_index, node_edges, edges = [], {}, [], []
+    def _nid(pt):
+        xy = _snap_xy(pt)
+        i = node_index.get(xy)
+        if i is None:
+            i = len(nodes_xy); nodes_xy.append(xy); node_index[xy] = i; node_edges.append([])
+        return i
+
+    for i, ln in enumerate(parts_m):
+        if not ln or ln.is_empty: continue
+        u = _nid(Point(ln.coords[0])); v = _nid(Point(ln.coords[-1]))
+        eidx = len(edges)
+        edges.append(_Edge(u=u, v=v, length=float(ln.length), geom=ln,
+                           parent_idx=i, parent_feature_id=int(part_ids[i])))
+        node_edges[u].append(eidx); node_edges[v].append(eidx)
+
+    find, unite = _dsu_build(len(nodes_xy))
+    for e in edges: unite(e.u, e.v)
+    comp = [find(i) for i in range(len(nodes_xy))]
+
+    edge_geoms = [e.geom for e in edges]
+    edge_tree = STRtree(edge_geoms)
     edge_idx_by_id = {id(g): i for i, g in enumerate(edge_geoms)}
 
     if log_timing:
-        logger.info("coast_graph summary: nodes=%d edges=%d comps=%d", len(nodes_xy), len(edges), 1+max(node_comp_id) if node_comp_id else 0)
+        logger.info("coast_graph summary: nodes=%d edges=%d comps=%d snap_m=%.1f built=%.2fs",
+                    len(nodes_xy), len(edges), len(set(comp)), float(snap_m), time.time()-t0)
 
-    cg = CoastGraph(
-        nodes_xy=nodes_xy,
-        edges=edges,
-        node_edges=node_edges,
-        edge_tree=edge_tree,
-        edge_idx_by_id=edge_idx_by_id,
-        node_comp_id=node_comp_id,
-    )
-    _COAST_GRAPH_MEMO[k] = cg
-    return cg
+    return CoastGraph(nodes_xy=nodes_xy, edges=edges, node_edges=node_edges,
+                      edge_tree=edge_tree, edge_idx_by_id=edge_idx_by_id, node_comp_id=comp)
 
-def _nearest_edge_id(cg: CoastGraph, pt: Point) -> Optional[int]:
-    """Robust nearest edge index from STRtree that may return ints or geoms."""
-    near = cg.edge_tree.nearest(pt)
-    if near is None:
-        return None
-    if isinstance(near, numbers.Integral):
-        return int(near)
-    # shapely returns geometry
-    return cg.edge_idx_by_id.get(id(near))
+def _nearest_edge_id(cg, pt_m):
+    """
+    Return edge index for a metric point. Works with STRtree.nearest() that
+    returns either an int index or a geometry object.
+    """
+    obj = cg.edge_tree.nearest(pt_m)
+    # Shapely 2.x may return index
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    # Shapely 1.8 returns geometry; map via id
+    ei = cg.edge_idx_by_id.get(id(obj))
+    if ei is not None:
+        return ei
+    # Last resort: distance match
+    d = [np.inf if e.geom is None else pt_m.distance(e.geom) for e in cg.edges]
+    return int(np.argmin(d))
+
+def _graph_io_smoketest(cg, nodes, *, log_fn=print):
+    """Validate graph + router I/O. Run once after graph build."""
+    ok = True
+    need = ["edges","edge_tree","edge_idx_by_id","node_edges","node_comp_id"]
+    for k in need:
+        if not hasattr(cg, k):
+            log_fn(f"[IO] missing attr: {k}"); ok = False
+    if getattr(cg, "edges", None):
+        e0 = cg.edges[0]
+        for k in ["geom","length","u","v","parent_feature_id"]:
+            if not hasattr(e0, k):
+                log_fn(f"[IO] _Edge missing: {k}"); ok = False
+    # probe nearest return kind
+    p = nodes[0]["pt"]
+    obj = cg.edge_tree.nearest(p)
+    log_fn(f"[IO] nearest type: {type(obj).__name__}")
+    try:
+        eid = _nearest_edge_id(cg, p)
+        g = cg.edges[eid].geom
+        log_fn(f"[IO] nearest eid: {eid}, geom_type={getattr(g, 'geom_type', None)}")
+    except Exception as ex:
+        log_fn(f"[IO] nearest map failed: {ex}"); ok = False
+    # tiny A* check between two close nodes
+    try:
+        q = nodes[min(1, len(nodes)-1)]["pt"]
+        test_path = route_along_coast_astar(cg, p, q, delta_max_m=100_000, window_m=None, log_timing=False)
+        ok_path = bool(test_path) and not getattr(test_path, "is_empty", False)
+        log_fn(f"[IO] astar smoke ok={ok_path} len={getattr(test_path,'length',None)}")
+    except Exception as ex:
+        log_fn(f"[IO] astar threw: {ex}"); ok = False
+    return ok
 
 def _node_dist(nxy: Tuple[float,float], pt: Point) -> float:
     dx = nxy[0] - pt.x; dy = nxy[1] - pt.y
@@ -281,138 +308,128 @@ def _allowed_nodes_mask(cg: CoastGraph, A: Point, B: Point, window_m: Optional[f
             mask[i] = True
     return mask
 
-def route_along_coast_astar(cg: CoastGraph,
-                            A_m: Point,
-                            B_m: Point,
-                            *,
-                            delta_max_m: float = 250_000.0,
-                            split_tol_m: float = 5.0,
-                            window_m: Optional[float] = None,
-                            log_timing: bool = False) -> Optional[LineString]:
+def route_along_coast_astar(
+    cg: CoastGraph,
+    A_m: Point,
+    B_m: Point,
+    *,
+    delta_max_m: float = 250_000.0,
+    split_tol_m: float = 5.0,
+    window_m: Optional[float] = None,
+    log_timing: bool = False,
+) -> Optional[LineString]:
     """
     Coast-constrained shortest path from A to B along the coastline graph.
-    Returns LineString in metric CRS (WEBM) or None if no path found/over cap.
+    Returns a LineString in metric CRS (WEBM) or None if no path found/over cap.
+    The caller is responsible for any terminal stubs beyond the coast path.
     """
-    with _maybe_timer("astar:total", log_timing):
-    # find nearest edges
-        ea = _nearest_edge_id(cg, A_m)
-        eb = _nearest_edge_id(cg, B_m)
-        if ea is None or eb is None:
-            return None
-        E_a = cg.edges[ea]; E_b = cg.edges[eb]
+    # ---- map terminals to host edges ----
+    start_eid = _nearest_edge_id(cg, A_m)
+    goal_eid  = _nearest_edge_id(cg, B_m)
+    if start_eid is None or goal_eid is None:
+        return None
+    E_a = cg.edges[start_eid]
+    E_b = cg.edges[goal_eid]
 
-    # quick component gate based on host edges
-    comp_a = cg.node_comp_id[E_a.u]
-    comp_b = cg.node_comp_id[E_b.u]
-    if comp_a != comp_b:
+    # fast component gate
+    if cg.node_comp_id[E_a.u] != cg.node_comp_id[E_b.u]:
         return None
 
-    # project endpoints on host edges
+    # distances along host edges to terminal projections
     sa = float(E_a.geom.project(A_m))
     sb = float(E_b.geom.project(B_m))
 
-    # snap to existing node if near
-    def _snap_or_temp(edge: _Edge, s: float, pt: Point):
-        # near u?
+    # create temp nodes if terminals are not near existing endpoints
+    def _snap_or_temp(edge: _Edge, s: float, pt: Point) -> Tuple[int, Optional[Tuple]]:
         du = _node_dist((cg.nodes_xy[edge.u][0], cg.nodes_xy[edge.u][1]), pt)
         if du <= split_tol_m:
-            return edge.u, None  # base node
-        # near v?
+            return edge.u, None
         dv = _node_dist((cg.nodes_xy[edge.v][0], cg.nodes_xy[edge.v][1]), pt)
         if dv <= split_tol_m:
             return edge.v, None
-        # create temp node id and local temp edges description
-        temp_id = -(1 + int(round(s)))  # negative ids to mark temp; not used as index
+        # negative ids to denote ephemeral nodes; not used as indices into cg arrays
+        temp_id = -(1 + int(round(s)))
         return temp_id, (edge, s)
 
     start_node, start_tmp = _snap_or_temp(E_a, sa, A_m)
     goal_node,  goal_tmp  = _snap_or_temp(E_b, sb, B_m)
 
-    # precompute allowed nodes window
+    # optional spatial window mask
     allowed_mask = _allowed_nodes_mask(cg, A_m, B_m, window_m)
 
-    # A*: state is node_id (>=0 for base, <0 for temp)
+    # ---- A* over nodes (+ ephemeral terminals) ----
     def _neighbors(node_id: int):
-        # base node
         if node_id >= 0:
             for eid in cg.node_edges[node_id]:
                 e = cg.edges[eid]
                 other = e.v if e.u == node_id else e.u
-                # window prune
                 if allowed_mask is not None and not allowed_mask[other]:
                     continue
-                yield other, eid, None  # (next_node, via_edge_id, via_tmpinfo)
+                yield other, eid, None  # via real edge
         else:
-            # temp nodes connect only to their host edge endpoints
+            # ephemeral node connects to both endpoints of its host edge
             edge, s = (start_tmp if node_id == start_node else goal_tmp)
-            # two legs: to u and to v
             yield edge.u, None, ("temp", edge, s, edge.u)
             yield edge.v, None, ("temp", edge, s, edge.v)
 
     def _heuristic(nid: int) -> float:
         # Euclidean to B_m
         if nid >= 0:
-            x,y = cg.nodes_xy[nid]
-            dx = x - B_m.x; dy = y - B_m.y
-            return math.hypot(dx, dy)
-        # temp node: use its point
+            x, y = cg.nodes_xy[nid]
+            return math.hypot(x - B_m.x, y - B_m.y)
         edge, s = (start_tmp if nid == start_node else goal_tmp)
         p = _pt_on_edge(edge, s)
         return p.distance(B_m)
 
-    # distances and parents
-    g = {start_node: 0.0}
-    parent: Dict[int, Tuple[int, Optional[int], Optional[Tuple]]] = {}  # nid -> (prev_nid, via_eid, via_tmpinfo)
-    openpq: List[Tuple[float,int]] = []
-    heapq.heappush(openpq, ( _heuristic(start_node), start_node ))
+    g_cost: Dict[int, float] = {start_node: 0.0}
+    parent: Dict[int, Tuple[int, Optional[int], Optional[Tuple]]] = {}
+    openpq: List[Tuple[float, int]] = []
+    heapq.heappush(openpq, (_heuristic(start_node), start_node))
 
     max_f = float(delta_max_m) + 1e-6
-
-    visited = set()
+    visited: Set[int] = set()
     _visits = 0
-    _t_start = time.time()
-    while openpq:
-        f, u = heapq.heappop(openpq)
-        if u in visited:
-            continue
-        visited.add(u)
 
-        if u == goal_node:
-            break
-        if f > max_f:
-            # best possible already exceeds cap
-            return None
-
-        gu = g[u]
-        _visits += 1
-        if _trace_enabled and (_visits % 5000 == 0):
-            logger.debug("astar step visits=%d open=%d best_f=%.0f g=%.0f", _visits, len(openpq), f, gu)
-        for v, via_eid, via_tmp in _neighbors(u):
-            # compute step cost
-            if via_eid is not None:
-                e = cg.edges[via_eid]
-                step = e.length
-                # if neighbor is temp (goal temp), cost is handled when expanding temp, so full length here is fine
-            else:
-                # temp hop: distance along edge between s and endpoint
-                kind, e, s, end_node = via_tmp
-                if end_node == e.u:
-                    step = abs(s - 0.0)
-                else:
-                    step = abs(e.length - s)
-            alt = gu + step
-            if alt > delta_max_m + 1e-6:
+    with _maybe_timer("astar:total", log_timing):
+        while openpq:
+            f, u = heapq.heappop(openpq)
+            if u in visited:
                 continue
-            if v not in g or alt < g[v] - 1e-9:
-                g[v] = alt
-                parent[v] = (u, via_eid, via_tmp)
-                fv = alt + _heuristic(v)
-                heapq.heappush(openpq, (fv, v))
+            visited.add(u)
+
+            if u == goal_node:
+                break
+            if f > max_f:
+                return None
+
+            gu = g_cost[u]
+            _visits += 1
+            if _trace_enabled() and (_visits % 5000 == 0):
+                logger.debug("astar step visits=%d open=%d best_f=%.0f g=%.0f", _visits, len(openpq), f, gu)
+
+            for v, via_eid, via_tmp in _neighbors(u):
+                # step cost
+                if via_eid is not None:
+                    e = cg.edges[via_eid]
+                    step = e.length
+                else:
+                    # temp hop along a host edge from s to endpoint
+                    kind, e, s, end_node = via_tmp
+                    step = abs(s - 0.0) if end_node == e.u else abs(e.length - s)
+
+                alt = gu + step
+                if alt > delta_max_m + 1e-6:
+                    continue
+                if (v not in g_cost) or (alt < g_cost[v] - 1e-9):
+                    g_cost[v] = alt
+                    parent[v] = (u, via_eid, via_tmp)
+                    fv = alt + _heuristic(v)
+                    heapq.heappush(openpq, (fv, v))
 
     if goal_node not in parent and goal_node != start_node:
         return None
 
-    # reconstruct node chain
+    # ---- reconstruct and emit coast path geometry ----
     chain: List[Tuple[int, Optional[int], Optional[Tuple]]] = []
     cur = goal_node
     while cur != start_node:
@@ -421,10 +438,8 @@ def route_along_coast_astar(cg: CoastGraph,
         cur = prev
     chain.reverse()
 
-    # assemble geometry parts
     parts: List[LineString] = []
 
-    # helper to append substring for an edge between two node "positions"
     def _append_edge_segment(e: _Edge, n_from: int, n_to: int,
                              from_tmp: Optional[Tuple], to_tmp: Optional[Tuple]):
         if from_tmp is not None:
@@ -446,23 +461,17 @@ def route_along_coast_astar(cg: CoastGraph,
         if seg is not None and not seg.is_empty:
             parts.append(seg)
 
-    # seed with a tiny stub from A_m to its projection if needed
-    # (not strictly necessary; coast-only path suffices)
     prev_node = start_node
     prev_tmp = start_tmp
     for node, via_eid, via_tmp in chain:
-        # figure the edge we traversed
         if via_eid is not None:
             e = cg.edges[via_eid]
-            n_from = prev_node if prev_node >= 0 else (prev_tmp[3])  # endpoint we stepped from
-            n_to   = node      if node      >= 0 else (via_tmp[3])
+            n_from = prev_node if prev_node >= 0 else prev_tmp[3]
+            n_to   = node      if node      >= 0 else via_tmp[3]
             _append_edge_segment(e, n_from, n_to,
                                  prev_tmp if prev_node < 0 else None,
                                  via_tmp  if node      < 0 else None)
-        else:
-            # came via temp hop, that already encoded in parent[v]
-            # previous parent step must include a real edge; nothing to add here
-            pass
+        # temp→endpoint hop contributes when the subsequent real edge is appended
         prev_node = node
         prev_tmp = via_tmp
 
@@ -470,26 +479,63 @@ def route_along_coast_astar(cg: CoastGraph,
         return None
 
     u = unary_union(parts)
-    if isinstance(u, LineString):
-        merged = u
-    else:
-        merged = linemerge(u)
-
-    # ensure a LineString result
+    merged = u if isinstance(u, LineString) else linemerge(u)
     if merged.geom_type == "MultiLineString":
-        # pick the longest component
         merged = max(merged.geoms, key=lambda g: g.length)
 
     if log_timing:
         try:
-            logger.info(
-                "astar: visits=%d explored=%d chain=%d length_km=%.3f",
-                _visits, len(visited), len(chain), float(merged.length)/1000.0
-            )
+            logger.info("astar: visits=%d explored=%d chain=%d length_km=%.3f",
+                        _visits, len(visited), len(chain), float(merged.length) / 1000.0)
         except Exception:
             pass
 
     return merged
+
+def _emit_with_terminal_stubs(route_geom: LineString,
+                              A_pt: Point, B_pt: Point,
+                              cg: CoastGraph,
+                              tol_m: float = 5.0) -> Optional[LineString]:
+    if not route_geom or getattr(route_geom, "is_empty", False):
+        return None
+
+    # host edges at terminals
+    a_eid = _nearest_edge_id(cg, A_pt)
+    b_eid = _nearest_edge_id(cg, B_pt)
+    Ea = cg.edges[a_eid]; Eb = cg.edges[b_eid]
+
+    # distances along host edges to terminals
+    sA = float(Ea.geom.project(A_pt))
+    sB = float(Eb.geom.project(B_pt))
+
+    # distances along host edges to where the ROUTE actually begins/ends
+    first_pt = Point(route_geom.coords[0])
+    last_pt  = Point(route_geom.coords[-1])
+    tA = float(Ea.geom.project(first_pt))
+    tB = float(Eb.geom.project(last_pt))
+
+    # build stubs robustly by projection, order-agnostic
+    def _seg(ls, s0, s1):
+        a, b = (s0, s1) if s0 <= s1 else (s1, s0)
+        if abs(b - a) <= tol_m:  # ignore tiny gaps
+            return None
+        return _substring(ls, a, b)
+
+    pre  = _seg(Ea.geom, sA, tA)
+    post = _seg(Eb.geom, tB, sB)
+
+    pieces = []
+    if pre  is not None and not pre.is_empty:  pieces.append(pre)
+    pieces.append(route_geom)
+    if post is not None and not post.is_empty: pieces.append(post)
+
+    u = unary_union(pieces)
+    out = u if isinstance(u, LineString) else linemerge(u)
+    if out.geom_type == "MultiLineString":
+        out = max(out.geoms, key=lambda g: g.length)
+    return None if out.is_empty else out
+
+
 # ---------- normalize ----------
 def _detect_lon_lat(df):
     return _h_detect_lon_lat(df)
@@ -499,6 +545,20 @@ def _detect_event_id_col(df, preferred: str | None):
 
 def _detect_height_col(df, preferred: str | None):
     return _h_detect_height_col(df, preferred)
+
+def _endpoints(line: LineString):
+    return Point(line.coords[0]), Point(line.coords[-1])
+
+def _host_proj(pt, parts_tree, parts_m, part_ids, _idx_of_near):
+    j = _idx_of_near(parts_tree.nearest(pt))
+    host = parts_m[j]
+    s = float(host.project(pt))
+    return {
+        "j": j,
+        "pid": int(part_ids[j]),
+        "s": s,
+        "pt_on_host": host.interpolate(s),
+    }
 
 def normalize_runups(
         csv_path: str,
@@ -785,390 +845,6 @@ def build_runup_segments(
     out = gpd.GeoDataFrame({"parent_feature_id": parents, "geometry": segments_wgs84}, geometry="geometry", crs=WGS84)
     return out
 
-def infill_runup_segments(
-    snapped_gdf: gpd.GeoDataFrame,
-    base_segs_gdf: gpd.GeoDataFrame,
-    coast_lines_gs: gpd.GeoSeries,
-    *,
-    ht_lo_m: float = 0.2,
-    ht_hi_m: float = 0.5,
-    eps_km: float = 15.0,
-    min_samples: int = 2,
-    majority_threshold: float = 0.5,
-    same_parent_only: bool = False,
-    max_bridge_gap_km: float = 500.0,
-    min_combined_coverage: float = 0.6,
-    opts: Optional[InfillConfig] = None,
-) -> gpd.GeoDataFrame:
-    """Fill gaps using lower-height evidence. Returns extra segments to union with base.
-    This version fixes parent_feature_id vs j index confusion and undefined variables.
-    """
-    logger.info(
-        ">>> entered infill_runup_segments: snapped=%d segments=%d eps_km=%.2f min_samples=%d majority=%.2f same_parent=%s bridge_km=%.1f min_cov=%.2f",
-        0 if snapped_gdf is None else len(snapped_gdf),
-        0 if base_segs_gdf is None else len(base_segs_gdf),
-        eps_km, min_samples, majority_threshold, same_parent_only,
-        max_bridge_gap_km, min_combined_coverage,
-    )
-
-    # Options
-    _allow_zero_cover_bridge = bool(getattr(opts, 'bridge_allow_zero_cover', False))
-    _bridge_one_side = bool(getattr(opts, 'bridge_one_side', False))
-    _accept_singleton = bool(getattr(opts, 'accept_singleton', False))
-    _reject_log_limit = int(getattr(opts, 'log_rejects_limit', 50) or 50)
-    _seed_without_base = bool(getattr(opts, 'seed_without_base', False))
-    _seed_min_m = float(getattr(opts, 'seed_min_km', 1.0) or 1.0) * 1000.0
-
-    logger.debug(
-        "infill params effective: eps_km=%.2f min_samples=%d majority=%.2f bridge_max_km=%.1f min_cov=%.2f allow_zero_cover_bridge=%s one_side=%s accept_singleton=%s log_rejects_limit=%d seed_without_base=%s seed_min_km=%.2f",
-        eps_km, min_samples, majority_threshold, max_bridge_gap_km, min_combined_coverage,
-        _allow_zero_cover_bridge, _bridge_one_side, _accept_singleton,
-        _reject_log_limit, _seed_without_base, (_seed_min_m/1000.0),
-    )
-
-    # Heartbeat
-    _start_ts = time.time()
-    _stop_evt = threading.Event()
-    def _hb():
-        while not _stop_evt.wait(30.0):
-            logger.debug("infill_runup_segments heartbeat: running for %.1fs", time.time() - _start_ts)
-    _hb_thread = threading.Thread(target=_hb, name="infill_runup_segments_heartbeat", daemon=True)
-    _hb_thread.start()
-
-    try:
-        snapped = ensure_wgs84(snapped_gdf) if snapped_gdf is not None else gpd.GeoDataFrame(geometry=[], crs=WGS84)
-        base = ensure_wgs84(base_segs_gdf) if base_segs_gdf is not None else gpd.GeoDataFrame(geometry=[], crs=WGS84)
-        coast_lines = ensure_wgs84(coast_lines_gs) if coast_lines_gs is not None else gpd.GeoSeries([], crs=WGS84)
-
-        eps_m = float(eps_km) * 1000.0
-        bridge_m = float(max_bridge_gap_km) * 1000.0
-
-        # Coast parts and mappings
-        parts_meters, parent_ids = _coast_parts_3857(coast_lines)
-        parts_list = list(parts_meters)
-        if not parts_list:
-            return gpd.GeoDataFrame(geometry=[], crs=WGS84)
-        try:
-            _p, _pid, tree, _k = _MC.get_parts_3857_and_tree(gpd.GeoDataFrame(geometry=gpd.GeoSeries(coast_lines), crs=WGS84))
-        except Exception:
-            tree = STRtree(parts_list)
-        idx_by_geom = {id(g): j for j, g in enumerate(parts_list)}  # geom id -> j
-        j_by_pid = {int(pid): j for j, pid in enumerate(parent_ids)}  # pid -> j
-        pid_by_j = {j: int(pid) for j, pid in enumerate(parent_ids)}   # j -> pid
-        len_by_j = np.asarray([float(g.length) for g in parts_list], dtype=float)
-
-        # Base intervals keyed by j
-        base_intervals_j: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
-        if not base.empty:
-            base_m = to_metric(base)
-            for _, row in base_m.iterrows():
-                j = None
-                if "parent_feature_id" in row.index and row["parent_feature_id"] is not None:
-                    try:
-                        j = j_by_pid.get(int(row["parent_feature_id"]))
-                    except Exception:
-                        j = None
-                if j is None:
-                    rep = row.geometry.representative_point()
-                    ret = tree.nearest(rep)
-                    j = int(ret) if isinstance(ret, numbers.Integral) else idx_by_geom.get(id(ret))
-                if j is None:
-                    continue
-                line = parts_list[int(j)]
-                coords = list(row.geometry.coords)
-                svals = [line.project(Point(*c)) for c in coords]
-                s0, s1 = float(min(svals)), float(max(svals))
-                base_intervals_j[int(j)].append((s0, s1))
-            # merge per j
-            for jj in list(base_intervals_j.keys()):
-                base_intervals_j[jj] = _merge_intervals(base_intervals_j[jj], gap_merge_m=1.0)
-        logger.info(
-            "infill: prepared base_intervals for %d parents from %d base segments",
-            len([k for k, v in base_intervals_j.items() if v]),
-            0 if base is None else len(base),
-        )
-
-        # Active parent js to evaluate
-        active_from_snapped_j = set()
-        if not snapped.empty and {"parent_feature_id", "station_m"}.issubset(snapped.columns):
-            for pid in snapped["parent_feature_id"].astype(int).unique().tolist():
-                jj = j_by_pid.get(int(pid))
-                if jj is not None:
-                    active_from_snapped_j.add(int(jj))
-        active_from_base_j = set(j for j, v in base_intervals_j.items() if v)
-        parents_j = sorted(active_from_snapped_j.union(active_from_base_j))
-
-        extra_intervals_j: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
-        reject_logs = 0
-        reason_counts = Counter()
-
-        # Cluster low-band points per j then decide acceptability relative to base on same j
-        for jj in parents_j:
-            pid = pid_by_j[int(jj)]
-            sub = snapped[
-                (snapped["parent_feature_id"].astype(int) == pid)
-                & (snapped.get("runupHt", 0.0) >= ht_lo_m)
-                & (snapped.get("runupHt", 0.0) < ht_hi_m)
-            ] if not snapped.empty else snapped
-            if sub is None or sub.empty:
-                continue
-            s_vals = np.array(sub["station_m"].astype(float).tolist(), dtype=float)
-            if s_vals.size == 0:
-                continue
-            s_vals.sort()
-            # DBSCAN-like 1D clustering by gap>eps
-            breaks = np.where(np.diff(s_vals) > eps_m)[0]
-            clusters = np.split(s_vals, breaks + 1)
-
-            base_ivals = base_intervals_j.get(int(jj), [])
-            for cl in clusters:
-                if len(cl) < int(min_samples):
-                    if not (_accept_singleton and len(cl) == 1):
-                        if reject_logs < _reject_log_limit:
-                            logger.debug("infill reject pid=%d reason=min_samples len=%d min=%d", pid, len(cl), int(min_samples))
-                            reject_logs += 1
-                        reason_counts['min_samples'] += 1
-                        continue
-                s0, s1 = float(cl[0]), float(cl[-1])
-
-                # coverage fraction by base on same j
-                cover = 0.0
-                overlap_any = False
-                contains_point = False
-                if base_ivals:
-                    covered = []
-                    for a, b in base_ivals:
-                        if not (b < s0 or a > s1):
-                            overlap_any = True
-                        if a <= s0 <= b:
-                            contains_point = True
-                        lo, hi = max(a, s0), min(b, s1)
-                        if hi >= lo:
-                            covered.append((lo, max(hi, lo + 1e-6)))
-                    if covered and (s1 - s0) > 0:
-                        merged = _merge_intervals(covered, gap_merge_m=1.0)
-                        cover_len = sum(b - a for a, b in merged)
-                        cover = cover_len / max(1.0, (s1 - s0))
-                accept = cover >= float(majority_threshold)
-
-                # Bridging acceptance on same parent only
-                if same_parent_only and base_ivals:
-                    left = [b for b in base_ivals if b[1] <= s0]
-                    right = [b for b in base_ivals if b[0] >= s1]
-                    gap = float('inf')
-                    if left and right:
-                        L_end = max(b[1] for b in left)
-                        R_start = min(b[0] for b in right)
-                        gap = max(0.0, float(R_start) - float(L_end))
-                        if gap <= bridge_m:
-                            if cover >= float(min_combined_coverage) or _allow_zero_cover_bridge:
-                                accept = True
-                    if (not accept) and _bridge_one_side and (left or right):
-                        gap_left = float('inf')
-                        gap_right = float('inf')
-                        if left:
-                            L_end = max(b[1] for b in left)
-                            gap_left = max(0.0, float(s0) - float(L_end))
-                        if right:
-                            R_start = min(b[0] for b in right)
-                            gap_right = max(0.0, float(R_start) - float(s1))
-                        one_gap = min(gap_left, gap_right)
-                        if np.isfinite(one_gap) and one_gap <= bridge_m:
-                            if cover >= float(min_combined_coverage) or _allow_zero_cover_bridge:
-                                accept = True
-
-                # Degenerate cluster handling
-                span = float(s1 - s0)
-                if not accept:
-                    if span <= 1e-6 and (contains_point or overlap_any):
-                        accept = True
-                    elif overlap_any and span > 1e-6:
-                        accept = True
-
-                # Nearest-base proximity for singletons when no left/right
-                if not accept and span <= 1e-6 and (not base_ivals):
-                    # if allowed to seed without base, expand
-                    if _seed_without_base:
-                        mid = 0.5 * (s0 + s1)
-                        a = mid - 0.5 * max(_seed_min_m, span)
-                        b = mid + 0.5 * max(_seed_min_m, span)
-                        extra_intervals_j[int(jj)].append((float(a), float(b)))
-                        continue
-
-                if accept:
-                    extra_intervals_j[int(jj)].append((float(s0), float(s1)))
-                else:
-                    if reject_logs < _reject_log_limit:
-                        reasons = []
-                        if cover < float(majority_threshold):
-                            reasons.append("majority_fail")
-                        if same_parent_only:
-                            if not base_ivals:
-                                reasons.append("no_base_for_parent")
-                            else:
-                                reasons.append("bridge_failed")
-                        logger.debug(
-                            "infill reject pid=%d s0=%.0f s1=%.0f len_km=%.2f cover=%.2f reasons=%s",
-                            pid, s0, s1, (span/1000.0), cover, ",".join(reasons) or "unknown",
-                        )
-                        reject_logs += 1
-                        for r in reasons:
-                            reason_counts[r] += 1
-
-        # ---------------- Bridging pass (additive) ----------------
-        b_eps_m = float(getattr(opts, 'eps_km', 8.0)) * 1000.0
-        delta_std_m = float(getattr(opts, 'delta_std_km', 40.0)) * 1000.0
-        delta_long_m = float(getattr(opts, 'delta_long_km', 100.0)) * 1000.0
-        wA = float(getattr(opts, 'wA', 1.0))
-        wL = float(getattr(opts, 'wL', 0.7))
-        p_exp = float(getattr(opts, 'p_exp', 1.2))
-        tau_base = float(getattr(opts, 'tau_base', 0.2))
-        tau_step = float(getattr(opts, 'tau_step', 0.15))
-        pad_m = min(b_eps_m, 0.5 * delta_std_m)
-
-        # Low-band s-values per j
-        svals_by_j: Dict[int, np.ndarray] = {}
-        if not snapped.empty:
-            low = snapped[(snapped.get("runupHt", 0.0) >= ht_lo_m) & (snapped.get("runupHt", 0.0) < ht_hi_m)]
-            if not low.empty and {"parent_feature_id", "station_m"}.issubset(low.columns):
-                for pid, grp in low.groupby(low["parent_feature_id"].astype(int)):
-                    jj = j_by_pid.get(int(pid))
-                    if jj is None:
-                        continue
-                    sarr = np.asarray(grp["station_m"].astype(float).tolist(), dtype=float)
-                    sarr.sort()
-                    svals_by_j[int(jj)] = sarr
-
-        def _edge_hits(sarr: np.ndarray, b0: float, a1: float, tol_m: float) -> int:
-            if sarr is None or sarr.size == 0:
-                return 0
-            A = 0
-            j = int(np.searchsorted(sarr, b0))
-            near = []
-            if j < len(sarr): near.append(abs(sarr[j] - b0))
-            if j > 0: near.append(abs(sarr[j-1] - b0))
-            if near and min(near) <= tol_m: A += 1
-            k = int(np.searchsorted(sarr, a1))
-            near2 = []
-            if k < len(sarr): near2.append(abs(sarr[k] - a1))
-            if k > 0: near2.append(abs(sarr[k-1] - a1))
-            if near2 and min(near2) <= tol_m: A += 1
-            return min(2, A)
-
-        gaps_checked = 0
-        bridges_added = 0
-        pass_counts = [0, 0, 0]
-        unconditional_count = 0
-        seed_bridge_count = 0
-
-        for jj, ivals in base_intervals_j.items():
-            if not ivals or len(ivals) < 2:
-                continue
-            ivals_sorted = sorted(ivals)
-            parent_line = parts_list[int(jj)]
-            parent_len = float(len_by_j[int(jj)])
-            sarr = svals_by_j.get(int(jj), np.array([], dtype=float))
-            for k in range(len(ivals_sorted) - 1):
-                a0, b0 = ivals_sorted[k]
-                a1, b1 = ivals_sorted[k + 1]
-                L = max(0.0, float(a1) - float(b0))
-                if L <= 0:
-                    continue
-                if L > delta_long_m:
-                    continue
-                A = _edge_hits(sarr, float(b0), float(a1), b_eps_m)
-                Ln = (L / delta_long_m) ** p_exp
-                S = wA * A - wL * Ln
-                accepted = False
-
-                unc_km = getattr(opts, 'bridge_unconditional_under_km', None)
-                if unc_km is not None:
-                    try:
-                        if L <= float(unc_km) * 1000.0:
-                            accepted = True
-                            unconditional_count += 1
-                    except Exception:
-                        pass
-
-                if (not accepted) and (unc_km is not None) and (sarr is not None) and (sarr.size > 0):
-                    inside = sarr[(sarr > float(b0)) & (sarr < float(a1))]
-                    if inside.size > 0:
-                        diffs = np.maximum(inside - float(b0), float(a1) - inside)
-                        jbest = int(np.argmin(diffs))
-                        s = float(inside[jbest])
-                        left = s - float(b0)
-                        right = float(a1) - s
-                        if left <= float(unc_km) * 1000.0 and right <= float(unc_km) * 1000.0:
-                            aL = max(0.0, min(parent_len, float(b0) - pad_m))
-                            bL = max(0.0, min(parent_len, s + pad_m))
-                            aR = max(0.0, min(parent_len, s - pad_m))
-                            bR = max(0.0, min(parent_len, float(a1) + pad_m))
-                            if bL > aL:
-                                extra_intervals_j[int(jj)].append((aL, bL))
-                                bridges_added += 1
-                            if bR > aR:
-                                extra_intervals_j[int(jj)].append((aR, bR))
-                                bridges_added += 1
-                            accepted = True
-                            seed_bridge_count += 1
-
-                if (not accepted) and (L <= delta_std_m) and (S >= tau_base):
-                    accepted = True; pass_counts[0] += 1
-                if (not accepted) and (L <= 0.5 * (delta_std_m + delta_long_m)) and (S >= (tau_base + tau_step)):
-                    accepted = True; pass_counts[1] += 1
-                if (not accepted) and (L <= delta_long_m) and (S >= (tau_base + 2.0 * tau_step)):
-                    accepted = True; pass_counts[2] += 1
-
-                gaps_checked += 1
-                if accepted:
-                    a = max(0.0, min(parent_len, float(b0) - pad_m))
-                    b = max(0.0, min(parent_len, float(a1) + pad_m))
-                    if b > a:
-                        extra_intervals_j[int(jj)].append((a, b))
-                        bridges_added += 1
-
-        # Emit geoms for extra_intervals_j keyed by j
-        geoms: List[object] = []
-        pids: List[int] = []
-        for jj, ivals in extra_intervals_j.items():
-            if not ivals:
-                continue
-            ivals = _merge_intervals(ivals, gap_merge_m=1.0)
-            line = parts_list[int(jj)]
-            L = float(len_by_j[int(jj)])
-            pid = pid_by_j[int(jj)]
-            for a, b in ivals:
-                a = max(0.0, min(L, float(a)))
-                b = max(0.0, min(L, float(b)))
-                if b <= a:
-                    continue
-                seg = _substring(line, float(a), float(b))
-                if seg is not None and not seg.is_empty:
-                    geoms.append(seg)
-                    pids.append(int(pid))
-
-        gdf = gpd.GeoDataFrame(
-            {"parent_feature_id": pids, "geometry": geoms},
-            geometry="geometry",
-            crs=WEBM,
-        ).to_crs(WGS84)
-        try:
-            logger.info(
-                "infill summary: produced=%d rejects_logged=%d reason_counts=%s",
-                0 if gdf is None or gdf.empty else len(gdf), _reject_log_limit, dict(reason_counts),
-            )
-        except Exception:
-            pass
-        return gdf
-    finally:
-        _stop_evt.set()
-        _hb_thread.join(timeout=1.0)
-        logger.info(
-            "<<< exited infill_runup_segments in %.1fs",
-            time.time() - _start_ts,
-        )
-
-
 # ---------- inland polygons from runup segments ----------
 
 def runup_segments_to_inland_poly(
@@ -1278,440 +954,540 @@ def buffer_on_land(
     with _timer("buffer_on_land:intersect_land"):
         return gpd.overlay(gdf, land, how="intersection", keep_geom_type=True)
 
-# ---------- rule-based conservative infill bridging ----------
+# Drop-in replacement for runups.py:infill_coast_unified
+# New design: endpoint chaining using cache part-ids and coast_key.
+# - Uses tsunami_mem_cache to align terminals/boosters and the coast graph topology.
+# - Prefers explicit (coast_key, part_id, s_m) if present on inputs; otherwise falls back to nearest-part projection.
+# - Multi-pass daisy chaining between terminals with optional boosters. A* along coast with hard hop/total caps.
+# - Detailed tracing to identify bottlenecks.
 
-def infill_bridge_rulebased(
-    snapped_gdf: gpd.GeoDataFrame,
-    base_segs_gdf: gpd.GeoDataFrame,
-    coast_lines_gs: gpd.GeoSeries,
-    ray_hits_gdf: Optional[gpd.GeoDataFrame] = None,
+def infill_coast_unified(
+    snapped_gdf,                          # optional boosters source (runups_snapped)
+    base_segs_gdf,                        # REQUIRED: runups_segments_linestring; ideally has part_id + coast_key
+    coast_lines_gs,                       # REQUIRED: coastline lines (WGS84 or any)
+    ray_hits_gdf=None,                    # optional boosters source
     *,
-    delta_max_km: float = 250.0,
-    eps_edge_km: float = 10.0,
+    # chaining controls
+    hop_max_km: float | None = None,      # max coastal distance per hop; default=delta_max_km
+    total_max_km: float | None = None,    # total chain cap; default=delta_max_km
+    k_neighbors: int = 6,                 # candidate neighbors per node
+    passes: int = 3,                      # multi-pass daisy chain
+    # coastal graph connectivity
+    graph_snap_m: float = 250.0,          # snapping tolerance when building the coast graph
+    gap_padding_m: float | None = None,   # alias for graph_snap_m
+    # cross-parent allowed
+    allow_cross_parent: bool = True,
+    # boosters
+    use_lowht_seed: bool = False,
+    use_rays_seeds: bool = False,
     ht_lo_m: float = 0.2,
     ht_hi_m: float = 0.5,
-    same_parent_only: bool = False,
-    allow_cross_parent: bool = True,
-    use_rays_seeds: bool = True,
-    use_lowht_seed: bool = True,
+    # legacy CLI knobs kept for compatibility (not used by chaining core)
+    pad_km: float = 1.0,
+    delta_max_km: float = 750.0,
+    # logging and extras
     log_decisions: bool = False,
-    log_rejects_limit: int = 50,
+    log_rejects_limit: int = 200,
     log_timing: bool = False,
-) -> gpd.GeoDataFrame:
-    """Rule-based conservative infill that bridges base→base gaps on the same parent.
-    - Unconditionally bridges gaps ≤ delta_max_km.
-    - Uses low-Ht runups and ray hits as amplifiers to split longer gaps; sub-gaps must also be ≤ delta_max_km.
-    - Rays act only as amplifiers; no magnitude weighting here.
-    - If same_parent_only=False, a conservative cross-parent bridge is attempted by nearest endpoints, capped by delta_max_km.
-    Adds per-gap decision logs: pass/fail and reason.
+    **_ignore_kwargs,
+):
     """
-    t0 = time.time()
-    logger = logging.getLogger(__name__).getChild("runups")
-    tm = (lambda tag: _maybe_timer(tag, log_timing))
+    Endpoint-to-endpoint chaining with strict cache alignment.
 
-    # Normalize inputs
-    snapped = ensure_wgs84(snapped_gdf) if snapped_gdf is not None else gpd.GeoDataFrame(geometry=[], crs=WGS84)
-    base = ensure_wgs84(base_segs_gdf) if base_segs_gdf is not None else gpd.GeoDataFrame(geometry=[], crs=WGS84)
-    coast = ensure_wgs84(coast_lines_gs) if coast_lines_gs is not None else gpd.GeoSeries([], crs=WGS84)
-    rays = ensure_wgs84(ray_hits_gdf) if (ray_hits_gdf is not None and not ray_hits_gdf.empty) else None
+    Inputs:
+      - base_segs_gdf: LINESTRING features that represent existing runup segments.
+        Preferred columns: 'coast_key', 'part_id'. If absent, the function will project to the nearest
+        exploded coast part from tsunami_mem_cache for this call's coast and log a warning.
+      - coast_lines_gs: coastline lines; used to build a cached graph and as host for projection.
+      - snapped_gdf (optional boosters): points with 'runupHt' and preferably 'coast_key'/'part_id'.
+      - ray_hits_gdf (optional boosters): points; preferably include ('parent_id' or 'part_id') and 's_m'.
 
-    # Coast parts and parent lines in 3857
-    with tm("bridge:parts_3857"):
-        parts_meters, parent_ids = _coast_parts_3857(coast)
-    parts_list = list(parts_meters)
-    j_by_pid = {int(pid): j for j, pid in enumerate(parent_ids)}
-    len_by_j = np.asarray([float(g.length) for g in parts_list], dtype=float)
-    from pyproj import Transformer
-    _tf_3857_to_4326 = Transformer.from_crs(WEBM, WGS84, always_xy=True).transform
+    Returns: GeoDataFrame (WGS84) with columns
+      - geometry: LINESTRING
+      - coast_key: cache key for the coast used
+      - part_id_start, part_id_end: exploded-part ids at endpoints
+      - parent_feature_id: compatibility tag (set to part_id_start)
+    """
+    # ---- local imports / globals from module ----
+    import math, time
+    import numpy as np
+    import pandas as pd
+    import geopandas as gpd
+    from shapely.geometry import Point, LineString, MultiLineString
+    from shapely.ops import linemerge
+    from contextlib import contextmanager
+    import logging as _logging
 
-    t_graph = time.time()
-    coast_graph = build_coast_graph_from_coast(coast, log_timing=log_timing)  # coast_lines is WGS84 GeoSeries
-    if log_timing:
-        try:
-            logger.info("coast_graph: nodes=%d edges=%d build=%.2fs",
-                        coast_graph.number_of_nodes(),
-                        coast_graph.number_of_edges(),
-                        time.time() - t_graph)
-        except Exception:
-            logger.info("coast_graph built in %.2fs", time.time() - t_graph)
+    # These utilities must exist in runups.py module scope
+    # - ensure_wgs84, to_metric, build_coast_graph_from_coast, route_along_coast_astar
+    # - WGS84, WEBM, _MC (TsunamiMemCache instance)
+    logger = _logging.getLogger("natural_disasters.infill.unified.cachechain")
 
-    # Build base intervals per parent (meters alongshore)
-    base_intervals_j: Dict[int, List[Tuple[float, float]]] = {}
-    with tm("bridge:base_to_metric"):
-        base_m = to_metric(base)
-    for _, row in base_m.iterrows():
-        # Prefer inherent parent id if present to avoid drift
-        j = None
-        if "parent_feature_id" in row.index:
+    # --- timers
+    @contextmanager
+    def _timer(tag: str):
+        t0 = time.time()
+        yield
+        if logger.isEnabledFor(_logging.DEBUG):
+            logger.debug("%s in %.2fs", tag, time.time() - t0)
+
+    # --- defaults
+    if hop_max_km is None:
+        hop_max_km = float(delta_max_km)
+    if total_max_km is None:
+        total_max_km = float(delta_max_km)
+    hop_max_m = float(hop_max_km) * 1000.0
+    total_max_m = float(total_max_km) * 1000.0
+    snap_m = float(gap_padding_m) if gap_padding_m is not None else float(graph_snap_m)
+
+    # --- normalize inputs
+    coast_wgs = gpd.GeoSeries(ensure_wgs84(coast_lines_gs)) if not isinstance(coast_lines_gs, gpd.GeoSeries) else ensure_wgs84(coast_lines_gs)
+    base = gpd.GeoDataFrame(geometry=ensure_wgs84(base_segs_gdf).geometry, crs=WGS84).join(ensure_wgs84(base_segs_gdf).drop(columns=["geometry"], errors="ignore"))
+    snaps = None if snapped_gdf is None else ensure_wgs84(snapped_gdf)
+    rays  = None if ray_hits_gdf is None else ensure_wgs84(ray_hits_gdf)
+
+    if base is None or base.empty:
+        return gpd.GeoDataFrame(geometry=[], crs=WGS84)
+
+    parts_m, part_ids, parts_tree, idmap, coast_key = _MC.get_parts_tree_index(
+        gpd.GeoDataFrame(geometry=coast_wgs, crs=WGS84), simplify_m=0.0
+    )
+
+    pid_to_idx = {int(pid): i for i, pid in enumerate(part_ids)}  # replaces all pid_to_idx
+
+    def _idx_of_near(near_obj):
+        """
+        Map STRtree.nearest(...) result to parts_m index.
+        Supports Shapely/PyGEOS variants that return either an int index or a geometry.
+        """
+        import numpy as _np
+
+        # Case 1: tree returns index directly
+        if isinstance(near_obj, (int, _np.integer)):
+            return int(near_obj)
+
+        # Case 2: tree returns geometry; use id->idx map first
+        i = idmap.get(id(near_obj))
+        if i is not None:
+            return i
+
+        # Case 3: fallback by identity/equality
+        for j, g in enumerate(parts_m):
+            if g is near_obj:
+                return j
             try:
-                j = j_by_pid.get(int(row["parent_feature_id"]))
+                if hasattr(near_obj, "equals_exact") and near_obj.equals_exact(g, 0.0):
+                    return j
             except Exception:
-                j = None
-        if j is None:
-            # Fallback to nearest parent by representative point
-            rep = row.geometry.representative_point()
-            dists = [rep.distance(ln) for ln in parts_list]
-            j = int(np.argmin(dists)) if dists else None
-        if j is None:
-            continue
-        line = parts_list[int(j)]
-        coords = list(row.geometry.coords)
-        svals = [line.project(Point(*c)) for c in coords]
-        s0, s1 = float(min(svals)), float(max(svals))
-        base_intervals_j.setdefault(int(j), []).append((s0, s1))
+                pass
 
-    # Merge base intervals
-    for pid in list(base_intervals_j.keys()):
-        base_intervals_j[pid] = _h_merge_intervals(base_intervals_j[pid], gap_merge_m=1.0)
+        # Case 4: last resort distance match (should rarely run)
+        d = [_np.inf if g is None else near_obj.distance(g) for g in parts_m]
+        return int(_np.argmin(d))
 
-    # Collect amplifiers per parent: low-Ht runups and ray hits, as station arrays
-    ampl_by_parent: Dict[int, np.ndarray] = {}
-    if use_lowht_seed and snapped is not None and not snapped.empty:
-        if ("runupHt" in snapped.columns) and ("parent_feature_id" in snapped.columns) and ("station_m" in snapped.columns):
-            low = snapped[(snapped["runupHt"] >= float(ht_lo_m)) & (snapped["runupHt"] < float(ht_hi_m))]
-            for pid, grp in low.groupby(low["parent_feature_id"].astype(int)):
-                arr = np.array(grp["station_m"].astype(float).tolist(), dtype=float)
-                if arr.size:
-                    arr.sort()
-                    ampl_by_parent[int(pid)] = arr
-    if use_rays_seeds and rays is not None and not rays.empty:
-        if ("parent_id" in rays.columns) and ("s_m" in rays.columns):
-            for pid, grp in rays.groupby(rays["parent_id"].astype(int)):
-                arr = np.array(grp["s_m"].astype(float).tolist(), dtype=float)
-                if arr.size:
-                    arr.sort()
-                    ampl_by_parent.setdefault(int(pid), np.array([], dtype=float))
-                    ampl_by_parent[int(pid)] = np.sort(np.concatenate([ampl_by_parent[int(pid)], arr]))
+    # --- pull exploded parts and tree from cache to get a stable coast_key and part ids
+    #with _timer("cache:get_parts_3857_and_tree"):
+    #    parts_m, part_ids, tree, coast_key = _MC.get_parts_3857_and_tree(gpd.GeoDataFrame(geometry=coast_wgs, crs=WGS84))
+    #pid_to_idx = {int(pid): j for j, pid in enumerate(part_ids)}
 
-    delta_max_m = float(delta_max_km) * 1000.0
-    eps_m = float(eps_edge_km) * 1000.0
+    # --- build coast graph once with desired snap
+    with _timer("coast_graph"):
+        cg = _MC.get_coast_graph(coast_wgs, snap_m=snap_m, simplify_m=None)
 
-    # Bridge intervals to add
-    extra_by_parent: Dict[int, List[Tuple[float, float]]] = {}
-    total_gaps = 0
-    bridged_gaps = 0
-    added_km = 0.0
-    base_km = sum((b - a) for iv in base_intervals_j.values() for (a, b) in iv) / 1000.0
+    # ---------- node constructors ----------
+    def _host_for_row(row) -> tuple[int, object] | None:
+        """Resolve a row to (part_id, host_line_m). Prefer explicit part_id; else nearest part via STRtree."""
+        pid_val = row.get("part_id", None)
+        if pid_val is not None and not pd.isna(pid_val):
+            pid = int(pid_val)
+            j = pid_to_idx.get(pid)
+            if j is not None:
+                return pid, parts_m[j]
+        # fallback: nearest part in this coast
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            return None
+        # STRtree query
+        #try:
+        #    near = tree.nearest(geom)
+        #except Exception:
+            # fallback linear scan
+        #    dists = [geom.distance(ln) if ln is not None else math.inf for ln in parts_m]
+        #    j = int(np.argmin(dists))
+        #    return int(part_ids[j]), parts_m[j]
+        # find index of 'near' inside parts_m
+        # STRtree returns the geometry; map back by identity
+        #idx = None
+        #for jj, ln in enumerate(parts_m):
+        #    if ln is near:
+        #        idx = jj; break
+        #if idx is None:
+            # fallback distance match
+        #    dists = [geom.distance(ln) if ln is not None else math.inf for ln in parts_m]
+        #    idx = int(np.argmin(dists))
+        geom_m = to_metric(gpd.GeoSeries([geom], crs=WGS84)).iloc[0]
+        near = parts_tree.nearest(geom_m)
+        idx = _idx_of_near(near)
+        
+        return int(part_ids[idx]), parts_m[idx]
 
-    # Per-gap decision records
-    decisions: List[Dict[str, object]] = []
+    def _make_terminal_rows(seg_row):
+        """
+        Build two terminal nodes (start/end) for one base segment.
+        Returns: list[dict] with fields: kind, pid, s, pt, seg_id, seg_end.
+        - kind   : "term"
+        - pid    : coast part id hosting this endpoint
+        - s      : arclength (m) along host part
+        - pt     : shapely Point in metric CRS on host part at s
+        - seg_id : identifier of the source segment (best-effort)
+        - seg_end: 0 for first coord, 1 for last coord
+        Requires outer-scope: parts_tree, parts_m, part_ids, pid_to_idx (optional),
+                            to_metric, WGS84, _idx_of_near.
+        """
+        import pandas as pd
+        from shapely.geometry import Point
+        import geopandas as gpd
 
-    # Endpoint caches for optional cross-parent bridging
-    right_pts_m: list[tuple[int, float, object, object]] = []  # (pid, s_right, point_m, point_wgs)
-    left_pts_m: list[tuple[int, float, object, object]] = []   # (pid, s_left, point_m, point_wgs)
+        g = seg_row.geometry
+        if g is None or g.is_empty:
+            return []
 
-    _last_hb = time.time()
-    for pid, ivals in base_intervals_j.items():
-        if _trace_enabled and (time.time() - _last_hb) > 30.0:
-            logger.debug("bridge hb: pid=%d gaps_so_far=%d bridged=%d", int(pid), total_gaps, bridged_gaps)
-            _last_hb = time.time()
-        if not ivals or len(ivals) < 2:
-            # Still record endpoints
-            j = int(pid)
-            line = parts_list[j]
-            for a, b in sorted(ivals):
-                pm_r = line.interpolate(float(b)); pm_l = line.interpolate(float(a))
-                xr, yr = _tf_3857_to_4326(pm_r.x, pm_r.y); xl, yl = _tf_3857_to_4326(pm_l.x, pm_l.y)
-                right_pts_m.append((j, float(b), pm_r, Point(xr, yr)))
-                left_pts_m.append((j, float(a), pm_l, Point(xl, yl)))
-            continue
+        # metric copy of this segment; pick longest LineString if multipart
+        seg_m = to_metric(gpd.GeoSeries([g], crs=WGS84)).iloc[0]
+        ls = max(seg_m.geoms, key=lambda x: x.length) if hasattr(seg_m, "geoms") else seg_m
+        endpoints = [Point(ls.coords[0]), Point(ls.coords[-1])]
 
-        ivals_sorted = sorted(ivals)
-        S = ampl_by_parent.get(int(pid), None)
+        # best-effort segment id
+        seg_id = seg_row.get("fid", seg_row.get("segment_id", seg_row.get("id", -1)))
+        try:
+            seg_id = int(seg_id) if not pd.isna(seg_id) else -1
+        except Exception:
+            seg_id = -1
 
-        # Iterate gaps between consecutive base intervals on this parent
-        for k in range(len(ivals_sorted) - 1):
-            a0, b0 = ivals_sorted[k]
-            a1, b1 = ivals_sorted[k + 1]
-            L = float(a1) - float(b0)
-            if L <= 0:
-                continue
-            total_gaps += 1
-            if log_timing and (total_gaps % 200 == 0):
-                logger.info("progress: checked %d gaps (bridged=%d) in %.2fs",
-                            total_gaps, bridged_gaps, time.time() - t0)
-
-            rec = {"pid": int(pid), "b0_m": float(b0), "a1_m": float(a1), "L_km": L / 1000.0, "pass": False, "reason": ""}
-
-            # Unconditional bridge for gaps within cap
-            if L <= delta_max_m:
-                extra_by_parent.setdefault(int(pid), []).append((float(b0), float(a1)))
-                bridged_gaps += 1
-                added_km += L / 1000.0
-                rec["pass"] = True
-                rec["reason"] = "unconditional"
-                decisions.append(rec)
-                continue
-
-            # Try amplifiers near edges
-            made_any = False
-            near_left, near_right = [], []
-
-            if S is not None and S.size:
-                # near left edge
-                j = int(np.searchsorted(S, float(b0)))
-                candidates = []
-                if j < len(S): candidates.append(S[j])
-                if j > 0: candidates.append(S[j - 1])
-                near_left = [float(s) for s in candidates if abs(float(s) - float(b0)) <= eps_m]
-
-                # near right edge
-                j2 = int(np.searchsorted(S, float(a1)))
-                candidates2 = []
-                if j2 < len(S): candidates2.append(S[j2])
-                if j2 > 0: candidates2.append(S[j2 - 1])
-                near_right = [float(s) for s in candidates2 if abs(float(s) - float(a1)) <= eps_m]
-
-            # Build sub-bridges for anchors found
-            for s in near_left:
-                Lsub = float(s) - float(b0)
-                if Lsub > 0 and Lsub <= delta_max_m:
-                    extra_by_parent.setdefault(int(pid), []).append((float(b0), float(s)))
-                    bridged_gaps += 1
-                    added_km += Lsub / 1000.0
-                    made_any = True
-
-            for s in near_right:
-                Lsub = float(a1) - float(s)
-                if Lsub > 0 and Lsub <= delta_max_m:
-                    extra_by_parent.setdefault(int(pid), []).append((float(s), float(a1)))
-                    bridged_gaps += 1
-                    added_km += Lsub / 1000.0
-                    made_any = True
-
-            if made_any:
-                rec["pass"] = True
-                if near_left and near_right:
-                    rec["reason"] = "amp_both_edges_ok"
-                elif near_left:
-                    rec["reason"] = "amp_left_ok"
-                elif near_right:
-                    rec["reason"] = "amp_right_ok"
+        # optional hint: if the segment row already has a part_id, prefer it
+        seg_part_hint = seg_row.get("part_id", None)
+        try:
+            if pd.isna(seg_part_hint):
+                seg_part_hint = None
             else:
-                if not S is None and S.size and (near_left or near_right):
-                    rec["reason"] = "amp_near_edge_but_subgap_too_long"
-                elif S is None or S.size == 0:
-                    rec["reason"] = "no_amplifiers_available"
-                else:
-                    rec["reason"] = "no_amplifiers_near_edges"
-            decisions.append(rec)
+                seg_part_hint = int(seg_part_hint)
+        except Exception:
+            seg_part_hint = None
 
-        # Record endpoints for cross-parent bridging
-        j = int(pid)
-        line = parts_list[j]
-        for a, b in ivals_sorted:
-            pm_r = line.interpolate(float(b)); pm_l = line.interpolate(float(a))
-            xr, yr = _tf_3857_to_4326(pm_r.x, pm_r.y); xl, yl = _tf_3857_to_4326(pm_l.x, pm_l.y)
-            right_pts_m.append((j, float(b), pm_r, Point(xr, yr)))
-            left_pts_m.append((j, float(a), pm_l, Point(xl, yl)))
+        out = []
+        for k, pt in enumerate(endpoints):
+            # choose host part: prefer hinted part_id when available, else nearest
+            if seg_part_hint is not None and "pid_to_idx" in globals():
+                j = pid_to_idx.get(seg_part_hint)
+                if j is None:
+                    # fall back to nearest if hint missing in cache
+                    near = parts_tree.nearest(pt)
+                    j = _idx_of_near(near)
+            else:
+                near = parts_tree.nearest(pt)
+                j = _idx_of_near(near)
 
-    # Merge intervals per parent and cut substrings
-    geoms = []
-    pids = []
-    for j_key, ivals in extra_by_parent.items():
-        ivals = _h_merge_intervals(ivals, gap_merge_m=1.0)
-        j = int(j_key)
-        line = parts_list[j]
-        with tm("bridge:cut_substrings"):
-            L = float(len_by_j[j])
-            for a, b in ivals:
-                a = max(0.0, min(L, float(a)))
-                b = max(0.0, min(L, float(b)))
-                if b <= a:
+            host = parts_m[j]
+            s = float(host.project(pt))
+            out.append({
+                "kind": "term",
+                "pid":  int(part_ids[j]),
+                "s":    s,
+                "pt":   host.interpolate(s),
+                "seg_id": seg_id,
+                "seg_end": 0 if k == 0 else 1,
+            })
+
+        return out
+
+
+
+    def _make_booster_rows(df_like, kind: str) -> list[dict]:
+        out = []
+        if df_like is None or df_like.empty:
+            return out
+        Dm = to_metric(df_like)
+        #has_pid = ("part_id" in Dm.columns) or ("parent_id" in Dm.columns) or ("parent_feature_id" in Dm.columns)
+        for _, r in Dm.iterrows():
+            g = r.geometry
+            if g is None or g.is_empty:
+                continue
+            pid = None
+            if "part_id" in r and not pd.isna(r["part_id"]):
+                pid = int(r["part_id"])
+            elif "parent_id" in r and not pd.isna(r["parent_id"]):
+                pid = int(r["parent_id"])
+            elif "parent_feature_id" in r and not pd.isna(r["parent_feature_id"]):
+                # accept as part-id if it matches cache set; else fallback to nearest
+                v = int(r["parent_feature_id"])
+                if v in pid_to_idx:
+                    pid = v
+            
+            if pid is not None and pid in pid_to_idx:
+                host_m = parts_m[p] if (p := pid_to_idx[pid]) is not None else None
+                if host_m is None:
                     continue
-                seg = _substring(line, float(a), float(b))
-                if seg and not seg.is_empty:
-                    geoms.append(seg)
-                    pids.append(int(parent_ids[j]))
+                s = float(host_m.project(g))
+                out.append({"kind": kind, "pid": pid, "s": s, "pt": host_m.interpolate(s)})
+            else:
+                # nearest-part fallback
+                #try:
+                #    near = parts_tree.nearest(g)
+                #except Exception:
+                #    dists = [g.distance(ln) if ln is not None else math.inf for ln in parts_m]
+                #    j = int(np.argmin(dists)); host_m = parts_m[j]; pid2 = int(part_ids[j])
+                #else:
+                #    # map geom back to index
+                #    idx = None
+                #    for jj, ln in enumerate(parts_m):
+                #        if ln is near:
+                #            idx = jj; break
+                #    if idx is None:
+                #        dists = [g.distance(ln) if ln is not None else math.inf for ln in parts_m]
+                #        idx = int(np.argmin(dists))
+                #    host_m = parts_m[idx]; pid2 = int(part_ids[idx])
+                near = parts_tree.nearest(g)
+                idx  = _idx_of_near(near)
+                host_m = parts_m[idx]; pid2 = int(part_ids[idx])
+                s = float(host_m.project(g))
+                out.append({"kind": kind, "pid": pid2, "s": s, "pt": host_m.interpolate(s)})
+        return out
 
-        # Optional cross-parent bridges (conservative straight chord with coastal cap)
-    t_cp = time.time()
-    cp_bridges = 0
-    right_pts_m = right_pts_m if 'right_pts_m' in locals() else []
-    left_pts_m  = left_pts_m  if 'left_pts_m'  in locals() else []
-    try:
-        if allow_cross_parent and right_pts_m and left_pts_m:
-            import numbers
-            from shapely.strtree import STRtree
+    # ---------- collect nodes ----------
+    nodes: list[dict] = []
+    with _timer("collect_terminals"):
+        for _, row in base.iterrows():
+            nodes.extend(_make_terminal_rows(row))
+    boosters = []
+    with _timer("collect_boosters"):
+        if use_lowht_seed and snaps is not None and not snaps.empty and "runupHt" in snaps.columns:
+            # filter booster heights
+            S = snaps[(snaps["runupHt"].astype(float) >= float(ht_lo_m)) & (snaps["runupHt"].astype(float) < float(ht_hi_m))]
+            boosters.extend(_make_booster_rows(S, "boost"))
+        if use_rays_seeds and rays is not None and not rays.empty:
+            boosters.extend(_make_booster_rows(rays, "boost"))
+    nodes.extend(boosters)
 
-            left_geoms_m = [pm for (_j_l, _s, pm, _pw) in left_pts_m]
-            left_tree = STRtree(left_geoms_m)
-            left_idx_by_id = {id(g): i for i, g in enumerate(left_geoms_m)}
-            left_xy = np.asarray([(p.x, p.y) for p in left_geoms_m], dtype=float)
-
-            delta_max_m = float(delta_max_km * 1000.0)
-            near_gate_lo = 0.9 * delta_max_m  
-            K = 10
-
-            # Build the coastal graph once
-            coast_graph = coast_graph if 'coast_graph' in locals() else build_coast_graph_from_coast(coast)
-
-            # graph indices (CoastGraph, not networkx)
-            comp_label = coast_graph.node_comp_id  # list[int], index by node id
-
-            # nearest-node cache over CoastGraph node coordinates
-            node_points = [Point(x, y) for (x, y) in coast_graph.nodes_xy]
-            nodes_tree = STRtree(node_points)
-            node_ids = list(range(len(node_points)))
-            idx_by_geom_node = {id(g): i for i, g in enumerate(node_points)}
-            _nn_cache = {}
-
-            def nearest_node(pt: Point) -> int | None:
-                key = (round(pt.x, 1), round(pt.y, 1))
-                nid = _nn_cache.get(key)
-                if nid is not None:
-                    return nid
-                g = nodes_tree.nearest(pt)
-                idx = idx_by_geom_node.get(id(g))
-                nid = node_ids[int(idx)] if idx is not None else None
-                _nn_cache[key] = nid
-                return nid
-
-            def nearest_node(pt):
-                key = (round(pt.x, 1), round(pt.y, 1))
-                nid = _nn_cache.get(key)
-                if nid is not None:
-                    return nid
-                g = nodes_tree.nearest(pt)
-                idx = idx_by_geom_node.get(id(g))
-                nid = node_ids[int(idx)] if idx is not None else None
-                _nn_cache[key] = nid
-                return nid
-
-            seen = set()
-            if _trace_enabled():
-                # how many endpoints per parent
-                cnt_r = Counter([int(j) for (j,_,_,_) in right_pts_m])
-                cnt_l = Counter([int(j) for (j,_,_,_) in left_pts_m])
-                parents_r = set(cnt_r.keys()); parents_l = set(cnt_l.keys())
-                crossable = len(parents_r.intersection(parents_l))  # should be > 1 to be interesting
-                logger.debug("cp: parents_right=%d parents_left=%d intersect=%d", len(parents_r), len(parents_l), crossable)
-
-            for j_r, s_r, pm_r, pw_r in right_pts_m:
-                xr, yr = pm_r.x, pm_r.y
-
-                # box query
-                cand = left_tree.query(box(xr - delta_max_m, yr - delta_max_m, xr + delta_max_m, yr + delta_max_m))
-                if hasattr(cand, "tolist"): cand = cand.tolist()
-                cand = list(cand or [])
-                if _trace_enabled():
-                    logger.debug("cp[%d]: box=%d", int(j_r), len(cand))
-                if not cand:
-                    continue
-
-                # indices
-                if cand and isinstance(cand[0], numbers.Integral):
-                    idxs = np.asarray([int(i) for i in cand], dtype=int)
-                else:
-                    idxs = np.asarray([left_idx_by_id.get(id(g)) for g in cand if left_idx_by_id.get(id(g)) is not None], dtype=int)
-                if idxs.size == 0:
-                    if _trace_enabled(): logger.debug("cp[%d]: idxs=0", int(j_r))
-                    continue
-
-                # distances and radius cut
-                dx = left_xy[idxs, 0] - xr; dy = left_xy[idxs, 1] - yr
-                d = np.hypot(dx, dy)
-                keep = d <= delta_max_m
-                if not np.any(keep):
-                    if _trace_enabled(): logger.debug("cp[%d]: within_cap=0", int(j_r))
-                    continue
-                idxs = idxs[keep]; d = d[keep]
-                if _trace_enabled():
-                    logger.debug("cp[%d]: within_cap=%d d_min=%.0f d_med=%.0f", int(j_r), idxs.size, float(d.min()), float(np.median(d)))
-
-                # remove same-parent here and report
-                same_parent = (np.asarray([left_pts_m[int(i)][0] for i in idxs], dtype=int) == int(j_r))
-                if np.any(same_parent):
-                    idxs = idxs[~same_parent]; d = d[~same_parent]
-                if _trace_enabled():
-                    logger.debug("cp[%d]: after_same_parent=%d", int(j_r), idxs.size)
-                if idxs.size == 0:
-                    continue
-
-                # component precheck in bulk
-                comp_ok = []
-                for li in idxs.tolist():
-                    j_l, s_l, pm_l, _ = left_pts_m[int(li)]
-                    u = nearest_node(pm_r); v = nearest_node(pm_l)
-                    if (u is None) or (v is None):
-                        continue
-                    try:
-                        if comp_label[u] != comp_label[v]:
-                            continue
-                    except Exception:
-                        pass
-                    comp_ok.append(li)
-                if _trace_enabled():
-                    logger.debug("cp[%d]: after_comp=%d", int(j_r), len(comp_ok))
-                if not comp_ok:
-                    continue
-
-                idxs = np.asarray(comp_ok, dtype=int)
-                d = np.asarray([float(np.hypot(left_xy[i,0]-xr, left_xy[i,1]-yr)) for i in idxs], dtype=float)
-
-                # density-aware budget
-                area = math.pi * (delta_max_m ** 2)
-                rho = (len(idxs) / area) if area > 0 else 1.0
-                Kloc = int(np.clip(math.ceil(8.0 / max(rho, 1e-6)), 6, 24))
-                if len(idxs) > Kloc:
-                    part = np.argpartition(d, Kloc - 1)[:Kloc]
-                    idxs, d = idxs[part], d[part]
-                order = np.argsort(d); idxs, d = idxs[order], d[order]
-                if _trace_enabled():
-                    logger.debug("cp[%d]: final_cand=%d Kloc=%d", int(j_r), len(idxs), Kloc)
-
-                for li, d_webm in zip(idxs.tolist(), d.tolist()):
-                    j_l, s_l, pm_l, pw_l = left_pts_m[int(li)]
-                    key = (int(j_r), int(j_l), float(s_r), float(s_l))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-
-                    win = float(min(delta_max_m, max(d_webm * 1.5, 2000.0)))
-                    with _trace("cp:route_try", jr=int(j_r), jl=int(j_l), d=int(d_webm)):
-                        path_m = route_along_coast_astar(
-                            coast_graph, pm_r, pm_l,
-                            delta_max_m=delta_max_m, window_m=win, log_timing=True
-                        )
-                    if path_m is None:
-                        continue
-
-                    geoms.append(path_m)
-                    pids.append(int(parent_ids[int(j_r)]))
-                    cp_bridges += 1
-                    break
-
-
-        logger.info(
-            "cross_parent summary: endpoints_right=%d endpoints_left=%d cp_bridges=%d",
-            len(right_pts_m), len(left_pts_m), cp_bridges
-        )
-    except Exception:
-        logger.exception("cross_parent bridging failed")
-
-    out = gpd.GeoDataFrame(
-        {
-            "parent_feature_id": pids, 
-            "geometry": geoms
-        },
-        geometry="geometry", 
-        crs=WEBM
-    ).to_crs(WGS84) if geoms else gpd.GeoDataFrame(geometry=[], crs=WGS84)
-    # Decision logs
-    try:
-        fails = [d for d in decisions if not d.get("pass")]
-        pass_n = len(decisions) - len(fails)
-        logger.info("infill decisions: tested=%d pass=%d fail=%d", len(decisions), pass_n, len(fails))
-        if log_decisions and fails:
-            limit = int(max(0, log_rejects_limit))
-            for d in fails[:limit]:
-                logger.debug("infill FAIL pid=%d L_km=%.2f reason=%s", int(d["pid"]), float(d["L_km"]), str(d["reason"]))
-    except Exception:
-        # Do not fail the pipeline on logging issues
-        pass
+    if not nodes:
+        return gpd.GeoDataFrame(geometry=[], crs=WGS84)
 
     logger.info(
-        "infill_bridge_rulebased: parents=%d total_gaps=%d bridged_gaps=%d added_km=%.1f base_km=%.1f elapsed=%.1fs",
-        len(base_intervals_j), total_gaps, bridged_gaps, added_km, base_km, time.time() - t0
+        "cachechain setup: coast_key=%s terminals=%d boosters=%d nodes=%d",
+        str(coast_key), sum(1 for n in nodes if n["kind"]=="term"), len(boosters), len(nodes)
     )
+    logger.info(
+        "params: hop_max_km=%.1f total_max_km=%.1f k_neighbors=%d passes=%d snap_m=%.1f",
+        float(hop_max_km), float(total_max_km), int(k_neighbors), int(passes), float(snap_m)
+    )
+    if logger.isEnabledFor(_logging.DEBUG) and nodes:
+        _graph_io_smoketest(cg, nodes, log_fn=lambda m: logger.debug(m))
+
+    # coordinates for neighbor work (WEBM)
+    coords = np.array([(n["pt"].x, n["pt"].y) for n in nodes], dtype=float)
+
+    # --- meta-edge routing cache
+    edges: dict[tuple[int,int], tuple[float, object] | None] = {}
+    edge_attempts = edge_euclid_skips = edge_astar_calls = edge_astar_succ = 0
+    
+    require_terminal_end = True
+
+    def _edge(i, j):
+        nonlocal edge_attempts, edge_euclid_skips, edge_astar_calls, edge_astar_succ
+        edge_attempts += 1
+        a, b = (i, j) if i < j else (j, i)
+        key = (a, b)
+        if key in edges: return edges[key]
+
+        if not (nodes[i]["kind"] == "term" or nodes[j]["kind"] == "term"):
+            edges[key] = None
+            return None
+
+        dx = math.hypot(coords[i,0]-coords[j,0], coords[i,1]-coords[j,1])
+        if dx > hop_max_m:
+            edge_euclid_skips += 1
+            edges[key] = None
+            return None
+
+        edge_astar_calls += 1
+        path = route_along_coast_astar(cg, nodes[i]["pt"], nodes[j]["pt"],
+                               delta_max_m=hop_max_m, window_m=None, log_timing=False)
+        if not path or getattr(path, "is_empty", False):
+            edges[key] = None; return None
+
+        bridge = _emit_with_terminal_stubs(path, nodes[i]["pt"], nodes[j]["pt"], cg, tol_m=0.0)
+        if not bridge:
+            edges[key] = None; return None
+        edges[key] = (float(bridge.length), bridge)
+        return edges[key]
+
+    out_paths_m: list[LineString | MultiLineString] = []
+    out_meta: list[tuple[int,int]] = []  # (start_term_idx, end_term_idx)
+    import heapq
+
+    for it in range(int(passes)):
+        logger.info("pass %d start", it+1)
+        term_indices = [i for i,n in enumerate(nodes) if n["kind"]=="term"]
+        new_paths_this_pass = 0
+
+        # Precompute neighbors once per pass using partial sort and Euclidean cutoff
+        max_euclid = hop_max_m * 1.05
+        d2 = ((coords[:,None,:] - coords[None,:,:])**2).sum(axis=2)
+        nbrs: list[list[int]] = []
+        k = int(k_neighbors) + 1
+        for i in range(d2.shape[0]):
+            cand = np.argpartition(d2[i], min(k, d2.shape[1]-1))[:k*3]  # widen pool
+            by_parent = {}
+            for j in cand:
+                if j == i: continue
+                if d2[i, j] > (max_euclid*max_euclid): continue
+                pid = nodes[j]["pid"]
+                if (pid not in by_parent) or d2[i, j] < d2[i, by_parent[pid]]:
+                    by_parent[pid] = j
+            idx = list(by_parent.values())
+            if not idx:
+                jmin = int(np.argmin(d2[i]))
+                if jmin != i: idx = [jmin]
+            nbrs.append(idx)
+
+        for si in term_indices:
+            # Dijkstra over the meta-graph
+            dist = {si: 0.0}
+            prev = {}
+            done = set()
+            heap = [(0.0, si)]
+            goal = None
+
+            while heap:
+                d0, u = heapq.heappop(heap)
+                if u in done: continue
+                done.add(u)
+
+                # goal: reach different-part terminal
+                if u != si and nodes[u]["kind"]=="term" and nodes[u]["pid"] != nodes[si]["pid"]:
+                    goal = u
+                    break
+
+                for v in nbrs[u]:
+                    e = _edge(u, v)
+                    if e is None:
+                        continue
+                    w, _geom = e
+                    nd = d0 + w
+                    if nd > total_max_m + 1e-6:
+                        continue
+                    if nd < dist.get(v, math.inf):
+                        dist[v] = nd
+                        prev[v] = u
+                        heapq.heappush(heap, (nd, v))
+
+            if goal is None:
+                continue
+
+            # reconstruct chain
+            path_idxs = [goal]
+            while path_idxs[-1] != si:
+                path_idxs.append(prev[path_idxs[-1]])
+            path_idxs.reverse()
+
+            segs = []
+            for a, b in zip(path_idxs[:-1], path_idxs[1:]):
+                L, geom = _edge(a, b)
+                segs.append(geom)
+            merged = linemerge(MultiLineString(segs)) if len(segs) > 1 else segs[0]
+            out_paths_m.append(merged)
+            out_meta.append((si, goal))
+            new_paths_this_pass += 1
+
+        logger.info("pass %d new_paths=%d", it+1, new_paths_this_pass)
+        if new_paths_this_pass == 0:
+            break
+
+        # Grow node set with endpoints of new paths to enable daisy chaining
+        new_nodes = []
+        for g_m in out_paths_m[-new_paths_this_pass:]:
+            # endpoints p0, p1 (works for LineString or MultiLineString)
+            if g_m.geom_type == "LineString":
+                p0 = Point(g_m.coords[0]); p1 = Point(g_m.coords[-1])
+            elif g_m.geom_type == "MultiLineString":
+                geoms = list(g_m.geoms)
+                p0 = Point(geoms[0].coords[0]); p1 = Point(geoms[-1].coords[-1])
+            else:
+                try:
+                    geoms = list(getattr(g_m, "geoms", []))
+                    p0 = Point(geoms[0].coords[0]); p1 = Point(geoms[-1].coords[-1])
+                except Exception:
+                    # as last resort, use endpoints of the merged path
+                    seq = list(g_m.coords)
+                    p0 = Point(seq[0]); p1 = Point(seq[-1])
+
+            # choose host part independently for each end
+            j0 = _idx_of_near(parts_tree.nearest(p0)); host0 = parts_m[j0]; pid0 = int(part_ids[j0])
+            j1 = _idx_of_near(parts_tree.nearest(p1)); host1 = parts_m[j1]; pid1 = int(part_ids[j1])
+            s0 = float(host0.project(p0)); s1 = float(host1.project(p1))
+
+            new_nodes.append({"kind":"aux","pid":pid0,"s":s0,"pt":host0.interpolate(s0)})
+            new_nodes.append({"kind":"aux","pid":pid1,"s":s1,"pt":host1.interpolate(s1)})
+           
+        if new_nodes:
+            nodes.extend(new_nodes)
+            coords = np.array([(n["pt"].x, n["pt"].y) for n in nodes], dtype=float)
+        term_indices = [i for i,n in enumerate(nodes) if n["kind"] == "term"]
+
+    logger.info("edge stats: attempts=%d euclid_skip=%d astar_calls=%d astar_succ=%d",
+            edge_attempts, edge_euclid_skips, edge_astar_calls, edge_astar_succ)
+
+    # --- emit
+    if not out_paths_m:
+        return gpd.GeoDataFrame(geometry=[], crs=WGS84)
+
+    out_wgs = gpd.GeoSeries(out_paths_m, crs=WEBM).to_crs(WGS84)
+    out = gpd.GeoDataFrame({"geometry": out_wgs}, geometry="geometry", crs=WGS84)
+
+    # tag endpoints
+    part_start = []
+    part_end   = []
+
+    for (si, gi), g_m in zip(out_meta, out_paths_m):
+        pid_s = int(nodes[si]["pid"]) if 0 <= si < len(nodes) else None
+        pid_e = int(nodes[gi]["pid"]) if 0 <= gi < len(nodes) else None
+
+        if g_m.geom_type == "LineString":
+            p0 = Point(g_m.coords[0]); p1 = Point(g_m.coords[-1])
+        elif g_m.geom_type == "MultiLineString":
+            geoms = list(g_m.geoms)
+            p0 = Point(geoms[0].coords[0]); p1 = Point(geoms[-1].coords[-1])
+        else:
+            try:
+                geoms = list(getattr(g_m, "geoms", []))
+                p0 = Point(geoms[0].coords[0]); p1 = Point(geoms[-1].coords[-1])
+            except Exception:
+                seq = list(g_m.coords)
+                p0 = Point(seq[0]); p1 = Point(seq[-1])
+
+        if pid_s is None:
+            near0 = parts_tree.nearest(p0)
+            j0 = _idx_of_near(near0)
+            pid_s = int(part_ids[j0])
+
+        if pid_e is None:
+            near1 = parts_tree.nearest(p1)
+            j1 = _idx_of_near(near1)
+            pid_e = int(part_ids[j1])
+
+        part_start.append(pid_s)
+        part_end.append(pid_e)
+
+    out["coast_key"] = str(coast_key)
+    out["part_id_start"] = part_start
+    out["part_id_end"] = part_end
+    # compatibility tag
+    out["parent_feature_id"] = out["part_id_start"].astype(int)
+
+    # simple length metric for visibility
+    try:
+        out["length_km"] = to_metric(out).length.values / 1000.0
+    except Exception:
+        pass
+
+    logger.info("cachechain done: rows=%d total_km=%.1f", len(out), float(out.get("length_km", pd.Series([])).sum()))
     return out
